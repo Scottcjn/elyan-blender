@@ -3,11 +3,12 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 """
-People: characters from a recipe, measured, and exported within budget.
+People: characters from a recipe, measured, able to talk, and exported within budget.
 
-Bodies, rigs and clothing come from the MPFB extension (MakeHuman for Blender),
-which must be installed separately. This add-on adds the recipe, the landmark
-contract and the game-ready export.
+Bodies, rigs, clothing and face shapes come from the MPFB extension (MakeHuman
+for Blender) and its asset packs, which must be installed separately. This
+add-on adds the recipe, the landmark contract, face checks, body motion, lip-sync
+tracks (``speech.py``), a runtime face player (``runtime/``) and the game-ready export.
 """
 
 bl_info = {
@@ -27,7 +28,7 @@ import bpy
 from bpy.props import BoolProperty, EnumProperty, StringProperty
 from bpy.types import Operator, Panel
 
-from . import build, export, recipe
+from . import build, export, motion, recipe
 
 PROFILE_ITEMS = (
     ('web', "Web / WebXR", "GLB for the browser"),
@@ -69,6 +70,9 @@ class ELYAN_OT_person_export(Operator):
     filepath: StringProperty(name="File", subtype='FILE_PATH')
     profile: EnumProperty(name="Profile", items=PROFILE_ITEMS)
     use_fbx: BoolProperty(name="Also FBX", description="Write an FBX for Unity beside the GLB", default=False)
+    use_motion: BoolProperty(
+        name="Body Motion", description="Include the idle, listen, talk, nod and shake animations", default=True,
+    )
 
     @classmethod
     def poll(cls, context):
@@ -81,7 +85,8 @@ class ELYAN_OT_person_export(Operator):
     def execute(self, context):
         rig = build.find_rig(context.object)
         formats = ("glb", "fbx") if self.use_fbx else ("glb",)
-        manifest = export.export(rig, bpy.path.abspath(self.filepath), self.profile, formats)
+        clips = tuple(motion.CLIPS) if self.use_motion else ()
+        manifest = export.export(rig, bpy.path.abspath(self.filepath), self.profile, formats, clips=clips)
         failures = manifest.get("validation", {}).get("failures", [])
         if failures:
             self.report({'WARNING'}, "Exported, but: " + "; ".join(failures))

@@ -18,7 +18,7 @@ import numpy as np
 
 from mathutils import kdtree
 
-from . import build, face
+from . import build, face, motion
 
 try:
     from elyan_llm import validate as _validate
@@ -337,8 +337,10 @@ def _select_only(objects, active):
 def _round_trip(path):
     """Read an exported GLB back and count what arrived."""
     before = set(bpy.data.objects)
+    actions = set(bpy.data.actions)
     bpy.ops.import_scene.gltf(filepath=path)
     arrived = [ob for ob in bpy.data.objects if ob not in before]
+    arrived_actions = [action for action in bpy.data.actions if action not in actions]
     # The importer adds a small unskinned mesh to draw bones with; it is not part of the asset.
     meshes = [ob for ob in arrived if ob.type == 'MESH' and ob.vertex_groups]
     result = {
@@ -348,16 +350,20 @@ def _round_trip(path):
         "bones": sum(len(ob.data.bones) for ob in arrived if ob.type == 'ARMATURE'),
         "shape_keys": max(
             (len(ob.data.shape_keys.key_blocks) - 1 for ob in meshes if ob.data.shape_keys), default=0),
+        "animations": sorted(action.name for action in arrived_actions),
     }
     for ob in arrived:
         bpy.data.objects.remove(ob)
+    for action in arrived_actions:
+        bpy.data.actions.remove(action)
     return result
 
 
-def export(rig, path, profile="web", formats=("glb",), keep=False):
+def export(rig, path, profile="web", formats=("glb",), keep=False, clips=()):
     """
     Write ``path`` (extension is replaced per format) for a delivery profile.
 
+    ``clips`` names body motions from ``motion.CLIPS`` to include as animations.
     Returns a manifest, also saved beside the files as ``<name>.manifest.json``.
     """
     limits = _validate.PROFILES[profile] if _validate else {"triangles": _FALLBACK_BUDGET[profile]}
@@ -401,6 +407,10 @@ def export(rig, path, profile="web", formats=("glb",), keep=False):
 
     _select_only([ob for ob, _kind in parts], basemesh)
     bpy.ops.object.join()
+    # Joining leaves merged shape keys switched on; a rest face has them all off.
+    if basemesh.data.shape_keys:
+        for block in basemesh.data.shape_keys.key_blocks[1:]:
+            block.value = 0.0
     basemesh.name = name
     export_rig.name = name + ".rig"
 
@@ -411,19 +421,23 @@ def export(rig, path, profile="web", formats=("glb",), keep=False):
     atlas.file_format = 'PNG'
     atlas.save()
 
+    animations = motion.add_clips(export_rig, clips) if clips else []
     _select_only([basemesh, export_rig], export_rig)
     files = {}
     if "glb" in formats:
         files["glb"] = stem + ".glb"
         bpy.ops.export_scene.gltf(
             filepath=files["glb"], export_format='GLB', use_selection=True,
-            export_skins=True, export_morph=True, export_animations=False, export_apply=False,
+            export_skins=True, export_morph=True, export_apply=False,
+            export_animations=bool(animations), export_animation_mode='NLA_TRACKS',
+            export_morph_animation=False, export_force_sampling=True,
         )
     if "fbx" in formats:
         files["fbx"] = stem + ".fbx"
         bpy.ops.export_scene.fbx(
             filepath=files["fbx"], use_selection=True, add_leaf_bones=False,
-            object_types={'ARMATURE', 'MESH'}, bake_anim=False, path_mode='COPY', embed_textures=True,
+            object_types={'ARMATURE', 'MESH'}, bake_anim=bool(animations), bake_anim_use_all_actions=False,
+            bake_anim_use_nla_strips=True, path_mode='COPY', embed_textures=True,
         )
 
     manifest = {
@@ -433,6 +447,7 @@ def export(rig, path, profile="web", formats=("glb",), keep=False):
         "contract": build.stored(rig)["contract"],
         "triangles_before": before,
         "shape_keys": sorted(rename.get(name, name) for name in wanted),
+        "animations": animations,
         "atlas": {"file": atlas.filepath_raw, "size": size},
         "files": {key: {"path": value, "bytes": os.path.getsize(value)} for key, value in files.items()},
     }
