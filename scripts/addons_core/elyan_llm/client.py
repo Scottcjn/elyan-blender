@@ -14,6 +14,7 @@ Command-line client for the Elyan LLM bridge. Standard library only.
    client.py screenshot OUT.png
    client.py api QUERY
    client.py backup [--label TEXT]
+   client.py validate [NAMES...] [--profile web|quest|vrchat_pc|prop]
    client.py quit
 """
 
@@ -120,6 +121,9 @@ def main():
     p.add_argument("--limit", type=int)
     p = sub.add_parser("backup")
     p.add_argument("--label")
+    p = sub.add_parser("validate")
+    p.add_argument("names", nargs="*", help="objects to check; default is the selection, else every mesh")
+    p.add_argument("--profile", default="web")
     sub.add_parser("quit")
     opts = parser.parse_args()
 
@@ -156,6 +160,10 @@ def main():
                 args[key] = getattr(opts, key)
     elif opts.cmd == "screenshot":
         args = {"path": os.path.abspath(opts.path)}
+    elif opts.cmd == "validate":
+        args = {"profile": opts.profile}
+        if opts.names:
+            args["names"] = opts.names
     elif opts.cmd == "object":
         if opts.name:
             args["name"] = opts.name

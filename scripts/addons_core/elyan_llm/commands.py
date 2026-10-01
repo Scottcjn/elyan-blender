@@ -433,6 +433,26 @@ def cmd_backup(args):
     return {"path": path, "bytes": os.path.getsize(path)}
 
 
+def cmd_validate(args):
+    """
+    Check objects against a delivery profile (see ``validate.PROFILES``).
+
+    ``names`` lists the objects; without it the selection is used, or failing that
+    every mesh in the scene. A rig given by name brings its skinned meshes along.
+    """
+    from . import validate
+    profile = args.get("profile") or "web"
+    if profile not in validate.PROFILES:
+        raise ValueError("unknown profile {!r}; known: {:s}".format(profile, ", ".join(sorted(validate.PROFILES))))
+    names = args.get("names")
+    if names:
+        objects = [bpy.data.objects[name] for name in names]
+        objects += [child for ob in objects if ob.type == 'ARMATURE' for child in ob.children_recursive]
+    else:
+        objects = list(bpy.context.selected_objects) or [ob for ob in bpy.context.scene.objects if ob.type == 'MESH']
+    return validate.validate(objects, profile)
+
+
 def cmd_quit(args):
     """End a headless ``serve()`` session. Refused in the UI, where the artist owns the window."""
     if quit_callback is None:
@@ -450,6 +470,7 @@ COMMANDS = {
     "screenshot": cmd_screenshot,
     "api": cmd_api,
     "backup": cmd_backup,
+    "validate": cmd_validate,
     "quit": cmd_quit,
 }
 
