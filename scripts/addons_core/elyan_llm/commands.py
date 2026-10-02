@@ -10,6 +10,7 @@ import ast
 import contextlib
 import importlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -831,6 +832,54 @@ def cmd_contact_sheet(args):
     return sheet.contact_sheet(args)
 
 
+def cmd_help(args):
+    """
+    What the bridge can do. With ``command``, that command's full description;
+    otherwise one line for each.
+    """
+    name = args.get("command")
+    if name:
+        func = COMMANDS.get(name)
+        if func is None:
+            raise ValueError("unknown command {!r}; known: {:s}".format(name, ", ".join(sorted(COMMANDS))))
+        return {"command": name, "help": inspect.cleandoc(func.__doc__ or "No description.")}
+    lines = {}
+    for key, func in sorted(COMMANDS.items()):
+        doc = inspect.cleandoc(func.__doc__ or "").strip()
+        lines[key] = doc.split("\n\n")[0].replace("\n", " ") if doc else ""
+    return {"commands": lines, "job_commands": list(JOB_COMMANDS)}
+
+
+def cmd_state(args):
+    """
+    Where things stand: the file, whether a person has it open in a window, what is
+    selected, open checkpoints, and the latest requests. The first call of a session.
+    """
+    from . import server, session
+    view_layer = bpy.context.view_layer
+    active = view_layer.objects.active
+    state = {
+        "blender": bpy.app.version_string,
+        "blend": bpy.data.filepath,
+        "dirty": bpy.data.is_dirty,
+        "window": not bpy.app.background,
+        "mode": bpy.context.mode,
+        "active": active.name if active else None,
+        "selected": [ob.name for ob in bpy.context.scene.objects if ob.select_get(view_layer=view_layer)][:50],
+        "collections": [c.name for c in bpy.context.scene.collection.children if not c.name.startswith("_checkpoint_")],
+        "checkpoints": [c.name[len("_checkpoint_"):] for c in bpy.data.collections if c.name.startswith("_checkpoint_")],
+        "generation": generation,
+        "recent": [
+            {"time": clock, "command": cmd, "what": what, "ok": ok} for clock, cmd, what, ok in list(server.log)[-8:]
+        ],
+        "window_selftest": session.read_selftest(),
+    }
+    # Parts that other modules add when they are present.
+    for key, func in STATE_EXTRAS.items():
+        state[key] = func()
+    return state
+
+
 def cmd_quit(args):
     """End a headless ``serve()`` session. Refused in the UI, where the artist owns the window."""
     if quit_callback is None:
@@ -857,8 +906,30 @@ COMMANDS = {
     "api": cmd_api,
     "backup": cmd_backup,
     "validate": cmd_validate,
+    "help": cmd_help,
+    "state": cmd_state,
     "quit": cmd_quit,
 }
+
+# ``state`` asks each of these for its part: name -> function returning something JSON can hold.
+STATE_EXTRAS = {}
+
+# Command groups that live in files of their own. Each defines ``COMMANDS`` and
+# may define ``STATE``; one that is missing is simply not offered.
+_GROUPS = ("contract", "compare", "marks", "staging")
+
+
+def _load_groups():
+    for name in _GROUPS:
+        try:
+            module = importlib.import_module("." + name, __package__)
+        except ImportError:
+            continue
+        COMMANDS.update(module.COMMANDS)
+        STATE_EXTRAS.update(getattr(module, "STATE", {}))
+
+
+_load_groups()
 
 
 def dispatch(cmd, args):

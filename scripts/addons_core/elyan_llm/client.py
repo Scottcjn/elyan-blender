@@ -23,6 +23,10 @@ Command-line client for the Elyan LLM bridge. Standard library only.
    client.py backup [--label TEXT]
    client.py validate [NAMES...] [--profile web|quest|vrchat_pc|prop]
    client.py quit
+   client.py state                      where things stand: the first call of a session
+   client.py help [COMMAND]             what each command does
+   client.py contract FILE [NAME [VALUE]] [--note WHY]   list or change a contract's numbers
+   client.py COMMAND key=value ...      any other bridge command (see help)
 """
 
 import argparse
@@ -38,6 +42,20 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import session  # noqa: E402
 
 ADDONS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+CARD = """\
+Elyan Blender bridge. Start with:  state   (and  help  for every command)
+
+  look    state  scene  object NAME  api QUERY  render OUT.png  contact_sheet OUT.png NAMES...
+  change  contract FILE NAME VALUE --note WHY   then   rebuild build/run.py --diff
+          exec -c CODE  is for probing; a builder script plus rebuild is for real work
+  check   check NAMES... [--seam JSON] [--clearance JSON]   validate --profile quest   snapshot / diff
+  safety  checkpoint NAME COLLECTION   rollback NAME   backup
+  long    --detach COMMAND ...   then   status JOB / result JOB
+  session launch [FILE.blend]   sessions   quit      (pass --pid N when several are running)
+
+The artist's corrections belong in the contract file as numbers. Look at the pictures you render.
+"""
 
 
 def pick_session(pid=None):
@@ -101,7 +119,34 @@ def launch(blender, blend, wait):
     sys.exit("Blender did not start serving within {:g}s, see {:s}".format(wait, log_path))
 
 
+def _value(text):
+    """A ``key=value`` value: JSON when it parses as JSON, otherwise the text itself."""
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+
+
+def _route_unknown(argv, known):
+    """Turn ``COMMAND key=value`` for a command this file has no parser for into ``call COMMAND ...``."""
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--pid":
+            index += 2
+        elif token.startswith("-"):
+            index += 1
+        else:
+            if token not in known:
+                return argv[:index] + ["call"] + argv[index:]
+            break
+    return argv
+
+
 def main():
+    if len(sys.argv) == 1:
+        sys.stdout.write(CARD)
+        return 0
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--pid", type=int, help="which Blender, when several bridges are running")
     parser.add_argument("--json", action="store_true", help="print the raw JSON response")
@@ -193,7 +238,20 @@ def main():
     p.add_argument("names", nargs="*", help="objects to check; default is the selection, else every mesh")
     p.add_argument("--profile", default="web")
     sub.add_parser("quit")
-    opts = parser.parse_args()
+    sub.add_parser("state")
+    p = sub.add_parser("help")
+    p.add_argument("command", nargs="?")
+    p = sub.add_parser("contract")
+    p.add_argument("file")
+    p.add_argument("name", nargs="?")
+    p.add_argument("value", nargs="?", help="new value, as JSON: 1.432 or [3.6, 2.5]")
+    p.add_argument("--note", default="", help="why, for the contract's changelog")
+    p.add_argument("--force", action="store_true", help="allow a different kind of value")
+    p = sub.add_parser("call")
+    p.add_argument("command")
+    p.add_argument("pairs", nargs="*", metavar="key=value")
+    p.add_argument("--args", help="arguments as one JSON object")
+    opts = parser.parse_args(_route_unknown(sys.argv[1:], set(sub.choices)))
 
     if opts.cmd == "sessions":
         for s in session.list_live():
@@ -205,8 +263,34 @@ def main():
         print("serving, pid {:d}".format(pid))
         return 0
 
+    if opts.cmd == "contract":
+        # Pure file work: no Blender needed.
+        import contract
+        request = {"file": opts.file}
+        if opts.name:
+            request["name"] = opts.name
+        if opts.value is not None:
+            request.update(value=_value(opts.value), note=opts.note, force=opts.force)
+        try:
+            print(json.dumps(contract.cmd_contract(request), indent=1))
+        except (contract.ContractError, OSError, SyntaxError) as ex:
+            sys.stderr.write("{!s}\n".format(ex))
+            return 1
+        return 0
+
     args = {}
-    if opts.cmd == "exec":
+    if opts.cmd == "call":
+        opts.cmd = opts.command
+        args = json_arg(opts.args) if opts.args else {}
+        for pair in opts.pairs:
+            key, sep, text = pair.partition("=")
+            if not sep:
+                parser.error("expected key=value, got {!r}".format(pair))
+            args[key] = _value(text)
+    elif opts.cmd == "help":
+        if opts.command:
+            args["command"] = opts.command
+    elif opts.cmd == "exec":
         if opts.code is not None:
             args["code"] = opts.code
         elif opts.file:

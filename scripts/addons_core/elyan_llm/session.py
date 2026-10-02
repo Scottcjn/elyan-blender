@@ -79,3 +79,16 @@ def list_live():
             except OSError:
                 pass
     return result
+
+
+def selftest_path():
+    return os.path.join(session_dir(), "window_selftest.json")
+
+
+def read_selftest():
+    """Result of the last in-window self-test on this machine, or None if it was never run."""
+    try:
+        with open(selftest_path(), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
