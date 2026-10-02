@@ -156,6 +156,20 @@ sidebar's Elyan tab. On by default.
 - Tested headless on both versions, including save and reload. The interactive
   browser and the shortcuts need a window and have not been tried.
 
+## Apply Pose as Rest Pose, with Meshes (`scripts/addons_core/elyan_restpose`)
+
+Blender's "Apply Pose as Rest Pose" changes only the armature, so rigged meshes
+jump. This makes the current pose the rest pose and keeps every mesh rigged to
+the armature, and every one of its shape keys, exactly as posed. Pose Mode:
+Pose > Apply, or the sidebar's Elyan tab. On by default.
+
+Measured on Blender 5.2.2 and 4.3.2 with a two-bone rig (rotated, one bone
+scaled), a mesh with a plain and a masked shape key under a subdivision
+modifier, and a second mesh without keys: vertex positions before and after
+differ by 0, at rest, with each key on and with a key half on. Masks and
+modifier visibility are put back. Objects parented directly to bones are not
+handled. Not tried in a window.
+
 ## Tools that used to ship with Blender
 
 Blender 4.2 moved its bundled add-ons out to an online extensions site. These
