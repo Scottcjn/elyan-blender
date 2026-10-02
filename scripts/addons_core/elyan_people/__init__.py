@@ -23,12 +23,46 @@ bl_info = {
 }
 
 import json
+import os
 
 import bpy
 from bpy.props import BoolProperty, EnumProperty, StringProperty
 from bpy.types import Operator, Panel
 
 from . import build, export, motion, recipe
+
+list_assets = build.list_assets
+
+
+def make(recipe, path, profile="web", clips=None, formats=("glb",), keep=False, sheet=False, split_head=None):
+    """
+    Recipe to files in one call: build the person, check the face, export, and return the manifest.
+
+    ``recipe`` is a dict or JSON text; ``clips`` names motions from ``motion.CLIPS`` (default: all).
+    The manifest gains ``build`` (seconds and the face check's verdict) and is saved again with it.
+    With ``keep`` false the person is removed from the scene afterwards, so calls do not pile up.
+    Raises ``recipe.RecipeError`` or ``build.MPFBMissing`` before anything is written.
+    """
+    rig, report = build.build(recipe)
+    clips = tuple(motion.CLIPS) if clips is None else tuple(clips)
+    manifest = export.export(
+        rig, path, profile, tuple(formats), clips=clips, sheet=sheet, split_head=split_head)
+    checked = report.get("face", {})
+    manifest["build"] = {
+        "seconds": report["seconds"],
+        "face_passed": checked.get("passed"),
+        "face_failures": checked.get("failures", []),
+        "face_notes": checked.get("notes", []),
+    }
+    manifest["timings"] = dict({"build": report["seconds"]}, **manifest["timings"])
+    stem = os.path.splitext(os.path.abspath(path))[0]
+    with open(stem + ".manifest.json", "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=1)
+    if not keep:
+        for ob in list(rig.children_recursive) + [rig]:
+            bpy.data.objects.remove(ob)
+    return manifest
+
 
 PROFILE_ITEMS = (
     ('web', "Web / WebXR", "GLB for the browser"),
@@ -63,7 +97,7 @@ class ELYAN_OT_person_create(Operator):
 
 
 class ELYAN_OT_person_export(Operator):
-    """Export the active person as one mesh with one material, within the profile's budget"""
+    """Export the active person with one material, within the profile's budget"""
     bl_idname = "elyan_people.export"
     bl_label = "Export Person"
 
@@ -71,7 +105,7 @@ class ELYAN_OT_person_export(Operator):
     profile: EnumProperty(name="Profile", items=PROFILE_ITEMS)
     use_fbx: BoolProperty(name="Also FBX", description="Write an FBX for Unity beside the GLB", default=False)
     use_motion: BoolProperty(
-        name="Body Motion", description="Include the idle, listen, talk, nod and shake animations", default=True,
+        name="Body Motion", description="Include every generated body motion as an animation", default=True,
     )
 
     @classmethod
@@ -92,6 +126,56 @@ class ELYAN_OT_person_export(Operator):
             self.report({'WARNING'}, "Exported, but: " + "; ".join(failures))
         else:
             self.report({'INFO'}, "Exported {:d} triangles".format(manifest["round_trip"]["triangles"]))
+        return {'FINISHED'}
+
+
+class ELYAN_OT_person_build_and_export(Operator):
+    """Create a person from a recipe and export it, in one step"""
+    bl_idname = "elyan_people.build_and_export"
+    bl_label = "Build and Export Person"
+
+    recipe: StringProperty(
+        name="Recipe", description="Recipe as JSON; empty gives the default person", default="",
+    )
+    recipe_file: StringProperty(
+        name="Recipe File", description="Read the recipe from this JSON file", subtype='FILE_PATH',
+    )
+    filepath: StringProperty(name="File", description="Where to write; the extension follows the format",
+                             subtype='FILE_PATH')
+    profile: EnumProperty(name="Profile", items=PROFILE_ITEMS)
+    clips: StringProperty(
+        name="Clips", description="Comma-separated body motions; \"all\" for every one, empty for none",
+        default="all",
+    )
+    use_fbx: BoolProperty(name="Also FBX", description="Write an FBX for Unity beside the GLB", default=False)
+    use_sheet: BoolProperty(
+        name="Contact Sheet", description="Render every clip's pose to one image (slow)", default=False,
+    )
+    keep: BoolProperty(name="Keep Person", description="Leave the person in the scene", default=False)
+
+    def execute(self, _context):
+        if not self.filepath:
+            self.report({'ERROR'}, "No file to write to")
+            return {'CANCELLED'}
+        try:
+            text = self.recipe
+            if self.recipe_file:
+                with open(bpy.path.abspath(self.recipe_file), encoding="utf-8") as fh:
+                    text = fh.read()
+            wanted = self.clips.strip()
+            clips = None if wanted == "all" else tuple(name.strip() for name in wanted.split(",") if name.strip())
+            manifest = make(
+                text or {}, bpy.path.abspath(self.filepath), self.profile, clips,
+                formats=("glb", "fbx") if self.use_fbx else ("glb",), keep=self.keep, sheet=self.use_sheet)
+        except (recipe.RecipeError, build.MPFBMissing, OSError, ValueError) as ex:
+            self.report({'ERROR'}, str(ex))
+            return {'CANCELLED'}
+        failures = manifest.get("validation", {}).get("failures", []) + manifest["build"]["face_failures"]
+        if failures:
+            self.report({'WARNING'}, "Exported, but: " + "; ".join(failures))
+        else:
+            self.report({'INFO'}, "Exported {:d} triangles in {:.0f} s".format(
+                manifest["round_trip"]["triangles"], sum(manifest["timings"].values())))
         return {'FINISHED'}
 
 
@@ -119,6 +203,7 @@ class ELYAN_PT_people(Panel):
 classes = (
     ELYAN_OT_person_create,
     ELYAN_OT_person_export,
+    ELYAN_OT_person_build_and_export,
     ELYAN_PT_people,
 )
 

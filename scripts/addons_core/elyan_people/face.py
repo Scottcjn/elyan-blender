@@ -38,6 +38,19 @@ COMPACT_EXPRESSIONS = (
     "jawOpen", "mouthClose", "mouthFunnel", "mouthPucker",
 )
 EYE_BONES = {"l": "eye_l", "r": "eye_r"}
+_CANONICAL = {renamed: name for name, renamed in VRCHAT_NAMES.items()}
+
+# Unity drops a blend shape that moves nothing when it imports an FBX, and VRChat needs all
+# fifteen in its list. Silence gets this much movement inside the mouth, where it cannot be seen.
+SILENCE_NUDGE = 0.0001
+
+# Gates fail only what cannot be a talking face; everything else is reported as a number.
+_SILENCE_MAX = 0.0002         # more than this and "sil" is no longer the rest face
+_DISTINCT_FROM_SIL = 0.0003   # RMS over the mouth; the faintest shape measured is 0.8 mm
+_DISTINCT_FROM_OTHER = 0.00025
+_ENERGY_ABOVE_NOSE = 0.25     # share of a mouth shape's movement allowed above the nose
+_BLINK_REMAINING = 0.5        # share of the eye's opening a blink may leave
+_POKE_AHEAD = 0.001           # teeth or tongue further forward than the lips
 
 
 def is_face_key(name):
@@ -122,8 +135,10 @@ def _offsets(basemesh):
 
     basis = read(blocks[0])
     scale = basemesh.matrix_world.to_scale().x
+    # An export for VRChat carries the mouth shapes under VRChat's names; they are the same shapes.
     return basis * scale, {
-        block.name: (read(block) - basis) * scale for block in blocks[1:] if is_face_key(block.name)
+        _CANONICAL.get(block.name, block.name): (read(block) - basis) * scale
+        for block in blocks[1:] if is_face_key(block.name)
     }
 
 
@@ -165,12 +180,140 @@ def _lip_opening(basis, halves, offset):
     return float(opening - (basis[upper, 2].mean() - basis[lower, 2].mean()))
 
 
+def _members(ob, group_name):
+    """Indices of the vertices in a vertex group, or None when the mesh has no such group."""
+    group = ob.vertex_groups.get(group_name)
+    if group is None:
+        return None
+    return np.array([
+        v.index for v in ob.data.vertices if any(g.group == group.index for g in v.groups)
+    ], dtype=np.int64)
+
+
+def _distinct(offsets, skin, keys, failures):
+    """
+    How far each mouth shape is from the rest face and from its nearest neighbour.
+
+    RMS in metres over the skin vertices any mouth shape moves, so a large quiet
+    head does not dilute a small mouth.
+    """
+    names = [name for name in VISEMES if name in offsets and name != "viseme_sil"]
+    if not names:
+        return
+    active = np.zeros(len(skin), dtype=bool)
+    for name in names:
+        active |= np.linalg.norm(offsets[name], axis=1) > 0.0001
+    active &= skin
+    if not active.any():
+        return
+    stack = np.array([offsets[name][active] for name in names])
+    for i, name in enumerate(names):
+        from_sil = float(np.sqrt((stack[i] ** 2).sum(axis=1).mean()))
+        keys[name]["rms_from_sil_mm"] = round(from_sil * 1000.0, 3)
+        if from_sil < _DISTINCT_FROM_SIL:
+            failures.append("{:s} is {:.2f} mm RMS from silence, which nobody would see".format(
+                name, from_sil * 1000.0))
+        others = [
+            (float(np.sqrt(((stack[i] - stack[j]) ** 2).sum(axis=1).mean())), names[j])
+            for j in range(len(names)) if j != i
+        ]
+        if others:
+            distance, nearest = min(others)
+            keys[name]["nearest"] = nearest
+            keys[name]["rms_from_nearest_mm"] = round(distance * 1000.0, 3)
+            # Each close pair is reported once.
+            if distance < _DISTINCT_FROM_OTHER and name < nearest:
+                failures.append("{:s} and {:s} differ by only {:.2f} mm RMS".format(
+                    name, nearest, distance * 1000.0))
+
+
+def _energy_above(offsets, co, skin, nose, keys, failures):
+    """Share of each mouth shape's squared movement that is above the nose."""
+    upper = skin & (co[:, 2] > nose)
+    for name in VISEMES:
+        if name not in offsets or name == "viseme_sil":
+            continue
+        energy = (offsets[name] ** 2).sum(axis=1)
+        total = float(energy[skin].sum())
+        if total <= 0.0:
+            continue
+        share = float(energy[upper].sum()) / total
+        keys[name]["above_nose"] = round(share, 4)
+        if share > _ENERGY_ABOVE_NOSE:
+            failures.append("{:s} puts {:.0f}% of its movement above the nose".format(name, share * 100.0))
+
+
+def _blink(offsets, co, skin, centers, keys, failures):
+    """
+    Opening left between the eyelids by a blink, against the rest face.
+
+    Taken in a narrow strip in front of the eye's centre: the lowest skin above
+    it and the highest skin below it are the lid edges.
+    """
+    for side, name in (("l", "eyeBlinkLeft"), ("r", "eyeBlinkRight")):
+        if name not in offsets or side not in centers:
+            continue
+        center = np.array(centers[side], dtype=np.float32)
+        strip = np.where(
+            skin & (np.abs(co[:, 0] - center[0]) < 0.006) & (np.abs(co[:, 2] - center[2]) < 0.02)
+            & (co[:, 1] < center[1]))[0]
+        upper, lower = strip[co[strip, 2] > center[2]], strip[co[strip, 2] <= center[2]]
+        if not len(upper) or not len(lower):
+            continue
+        rest = float(co[upper, 2].min() - co[lower, 2].max())
+        moved = co + offsets[name]
+        # Lids that overlap are closed; the overlap itself is not an opening.
+        closed = max(0.0, float(moved[upper, 2].min() - moved[lower, 2].max()))
+        keys[name]["eye_opening_rest_mm"] = round(rest * 1000.0, 2)
+        keys[name]["eye_opening_blink_mm"] = round(closed * 1000.0, 2)
+        if rest > 0.0 and closed > _BLINK_REMAINING * rest:
+            failures.append("{:s} leaves the eye {:.1f} mm open of {:.1f} mm".format(
+                name, closed * 1000.0, rest * 1000.0))
+
+
+def _inner_mouth(basemesh):
+    """``{kind: (positions, offsets)}`` for the teeth and tongue that belong to a person."""
+    rig = basemesh.parent
+    if rig is None:
+        return {}
+    properties = build.mpfb("entities.objectproperties", "GeneralObjectProperties")
+    found = {}
+    for ob in rig.children_recursive:
+        if ob.type != 'MESH' or not ob.data.shape_keys:
+            continue
+        kind = properties.get_value("object_type", entity_reference=ob)
+        if kind in {"Teeth", "Tongue"}:
+            found[kind.lower()] = (build._mixed_coordinates(ob), _offsets(ob)[1])
+    return found
+
+
+def _poke(basemesh, offsets, co, lips, keys, failures):
+    """
+    How far the teeth and tongue reach in front of the lips at each mouth shape.
+
+    The character faces -Y. Negative is behind the frontmost point of the lips,
+    where they belong; this does not catch a tooth through a cheek.
+    """
+    for kind, (part, part_offsets) in _inner_mouth(basemesh).items():
+        for name in VISEMES:
+            if name not in offsets:
+                continue
+            front = float((co[lips, 1] + offsets[name][lips, 1]).min())
+            moved = part[:, 1] + part_offsets[name][:, 1] if name in part_offsets else part[:, 1]
+            ahead = front - float(moved.min())
+            keys[name][kind + "_ahead_mm"] = round(ahead * 1000.0, 2)
+            if ahead > _POKE_AHEAD:
+                failures.append("{:s}: {:s} {:.1f} mm in front of the lips".format(name, kind, ahead * 1000.0))
+
+
 def check(basemesh):
     """
     Measure every face shape. ``failures`` lists what a render of the neutral face would not show.
 
     Checked: each shape moves something and nothing flies off; left and right shapes mirror
-    each other; lips meet for P/B/M and part for "aa"; no two shapes are the same shape.
+    each other; lips meet for P/B/M and part for "aa"; no two shapes are the same shape;
+    every mouth shape differs from silence and from the others; mouth shapes stay below the
+    nose; a blink closes the eye; teeth and tongue stay behind the lips.
     """
     if not basemesh.data.shape_keys:
         return {"keys": {}, "failures": ["the mesh has no shape keys"], "notes": [], "passed": False}
@@ -180,8 +323,12 @@ def check(basemesh):
     for name, offset in offsets.items():
         reach = float(np.linalg.norm(offset, axis=1).max())
         keys[name] = {"max_mm": round(reach * 1000.0, 2)}
-        # Silence is the rest face by definition.
-        if reach < 0.0002 and name != "viseme_sil":
+        # Silence is the rest face by definition; an export may nudge it so that Unity keeps it.
+        if name == "viseme_sil":
+            if reach > _SILENCE_MAX:
+                failures.append("viseme_sil moves a vertex {:.2f} mm; silence is the rest face".format(
+                    reach * 1000.0))
+        elif reach < 0.0002:
             failures.append("{:s} moves nothing".format(name))
         elif reach > 0.06:
             failures.append("{:s} moves a vertex {:.0f} mm, which is not a face shape".format(name, reach * 1000))
@@ -216,6 +363,25 @@ def check(basemesh):
             failures.append("lips do not close for P/B/M: {:.1f} mm apart".format(openings["viseme_PP"] * 1000))
         if openings["viseme_aa"] < 0.003:
             failures.append("mouth opens only {:.1f} mm for \"aa\"".format(openings["viseme_aa"] * 1000))
+
+    # The gates below need the person as built: body shape applied, landmarks still on the mesh.
+    # An exported mesh has lost its helper groups and skips them.
+    body = _members(basemesh, "body")
+    lips = _members(basemesh, "lips")
+    centers = build.eye_centers(basemesh)
+    if body is not None and len(body):
+        co = build._mixed_coordinates(basemesh)
+        skin = np.zeros(len(co), dtype=bool)
+        skin[body] = True
+        _distinct(offsets, skin, keys, failures)
+        if len(centers) == 2 and lips is not None and len(lips):
+            nose = (centers["l"].z + centers["r"].z + 2.0 * float(co[lips, 2].mean())) / 4.0
+            _energy_above(offsets, co, skin, nose, keys, failures)
+        _blink(offsets, co, skin, centers, keys, failures)
+        if lips is not None and len(lips):
+            _poke(basemesh, offsets, co, lips, keys, failures)
+    else:
+        notes.append("no landmark groups on this mesh; distinctness, blink and teeth gates skipped")
 
     names = [name for name in offsets if keys[name]["max_mm"] > 0.2]
     flat = np.array([offsets[name].ravel() for name in names])

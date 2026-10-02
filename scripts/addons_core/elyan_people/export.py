@@ -3,7 +3,8 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 """
-Export a person for a delivery target: one mesh, one material, one atlas, within budget.
+Export a person for a delivery target: one material, one atlas, within budget, as one
+mesh or as a head that carries the face shapes plus a body that does not.
 
 Works on a copy, the character in the scene is left as it was. Shape keys that
 are at zero (visemes, expressions) survive; those that are in use (the body's
@@ -11,12 +12,14 @@ shape) are baked in.
 """
 
 import json
+import math
 import os
+import time
 
 import bpy
 import numpy as np
 
-from mathutils import kdtree
+from mathutils import Vector, kdtree
 
 from . import build, face, motion
 
@@ -36,6 +39,16 @@ _TRIANGLE_CAP = {"Teeth": 1500, "Tongue": 250}
 _FLEXIBLE = ("Basemesh", "Hair", "Clothes")
 _FACE_BONES = ("head", "neck_01", "neck", "jaw")
 _FLOOR = "_elyan_reduction_floor"
+# Parts that belong to the face whatever they weigh, and the bones that mark the head's skin.
+_HEAD_KINDS = ("Teeth", "Tongue", "Eyes", "Eyebrows", "Eyelashes")
+_HEAD_BONES = ("head", "eye_l", "eye_r", "jaw")
+_HEAD_FACE = "_elyan_head"
+_VERTEX_ID = "_elyan_vertex"
+_VERTEX_NORMAL = "_elyan_normal"
+_KEY_OFFSET = "_elyan_key_"
+_VRCHAT = ("quest", "vrchat_pc")
+# Where a contact sheet's camera stands, as seen from the person, who faces -Y.
+_VIEWS = {"body": Vector((0.45, -1.0, 0.12)), "front": Vector((0.0, -1.0, 0.05)), "side": Vector((1.0, -0.05, 0.05))}
 _FALLBACK_BUDGET = {"web": 45000, "vrchat_pc": 70000, "quest": 15000}
 
 
@@ -68,6 +81,8 @@ def _settle_shape_keys(ob, wanted):
 
     Returns the rest ones named in ``wanted`` as ``(positions before, {name: offsets})``
     so they can be put back after the mesh has been reduced; other rest ones are dropped.
+    Their movement also rides along on the mesh as attributes, which reduction blends
+    the way it blends weights.
     """
     mesh = ob.data
     if not mesh.shape_keys:
@@ -83,29 +98,173 @@ def _settle_shape_keys(ob, wanted):
     mixed = _coordinates(mix.data, count)
     ob.shape_key_clear()
     mesh.vertices.foreach_set("co", mixed.ravel())
+    for number, offsets in enumerate(resting.values()):
+        attribute = mesh.attributes.new(_KEY_OFFSET + str(number), 'FLOAT_VECTOR', 'POINT')
+        attribute.data.foreach_set("vector", offsets.ravel())
     mesh.update()
     return (mixed, resting) if resting else None
 
 
 def _restore_shape_keys(ob, settled, rename):
     """
-    Put resting shape keys back. Each vertex takes the movement of the nearest
-    vertex of the mesh as it was, which is itself wherever nothing was reduced.
+    Put resting shape keys back, from the movement that rode along as attributes.
+
+    Taking each vertex's movement from the nearest vertex of the mesh as it was is only
+    the fallback: where two surfaces touch, as closed teeth do, the nearest vertex can
+    be on the wrong one, and a lower tooth then stays up when the jaw drops.
     """
     if settled is None:
         return
     before, resting = settled
     mesh = ob.data
-    tree = kdtree.KDTree(len(before))
-    for index, co in enumerate(before):
-        tree.insert(co, index)
-    tree.balance()
     now = _coordinates(mesh.vertices, len(mesh.vertices))
-    nearest = np.array([tree.find(co)[1] for co in now], dtype=np.int64)
+    nearest = None
     ob.shape_key_add(name="Basis")
-    for name, offsets in resting.items():
+    for number, (name, offsets) in enumerate(resting.items()):
+        attribute = mesh.attributes.get(_KEY_OFFSET + str(number))
+        if attribute is not None and attribute.domain == 'POINT' and len(attribute.data) == len(now):
+            carried = np.empty(len(now) * 3, dtype=np.float32)
+            attribute.data.foreach_get("vector", carried)
+            carried = carried.reshape(-1, 3)
+        else:
+            if nearest is None:
+                tree = kdtree.KDTree(len(before))
+                for index, co in enumerate(before):
+                    tree.insert(co, index)
+                tree.balance()
+                nearest = np.array([tree.find(co)[1] for co in now], dtype=np.int64)
+            carried = offsets[nearest]
         block = ob.shape_key_add(name=rename.get(name, name))
-        block.data.foreach_set("co", (now + offsets[nearest]).ravel())
+        block.data.foreach_set("co", (now + carried).ravel())
+    for attribute in [a for a in mesh.attributes if a.name.startswith(_KEY_OFFSET)]:
+        mesh.attributes.remove(attribute)
+
+
+def _nudge_silence(parts, name):
+    """
+    Give the silence shape a movement too small to see, on a few vertices at the back of
+    the tongue (or the teeth), so importers that discard empty shapes keep it.
+
+    Returns the kind of part that was moved, or None when there was nothing inside the mouth.
+    """
+    for wanted in ("Tongue", "Teeth"):
+        ob = next((ob for ob, kind in parts if kind == wanted), None)
+        if ob is None:
+            continue
+        mesh = ob.data
+        if not mesh.shape_keys:
+            ob.shape_key_add(name="Basis")
+        block = mesh.shape_keys.key_blocks.get(name) or ob.shape_key_add(name=name)
+        block.value = 0.0
+        # From the rest shape, not from the new key: a key added to a mesh that already
+        # has keys does not reliably start as a copy of it.
+        co = _coordinates(mesh.shape_keys.key_blocks[0].data, len(mesh.vertices))
+        # The character faces -Y, so the largest Y is the deepest in the mouth.
+        for index in np.argsort(co[:, 1])[-3:]:
+            co[index, 2] += face.SILENCE_NUDGE
+        block.data.foreach_set("co", co.ravel())
+        return wanted
+    return None
+
+
+def _mark_head(parts):
+    """
+    Flag, per face, what goes into the head mesh: the face parts whole, and of the skin
+    whatever a shape key moves or the head bones hold, with two rings to spare.
+
+    The spare rings put the seam where nothing moves, so the two meshes cannot part there
+    and the lighting across it does not change when the face does.
+    """
+    for ob, kind in parts:
+        mesh = ob.data
+        flags = np.zeros(len(mesh.polygons), dtype=np.int32)
+        if kind in _HEAD_KINDS:
+            flags[:] = 1
+        elif kind == "Basemesh":
+            count = len(mesh.vertices)
+            core = np.zeros(count, dtype=bool)
+            if mesh.shape_keys:
+                blocks = mesh.shape_keys.key_blocks
+                basis = _coordinates(blocks[0].data, count)
+                for block in blocks[1:]:
+                    core |= np.abs(_coordinates(block.data, count) - basis).max(axis=1) > 1e-7
+            indices = {ob.vertex_groups[name].index for name in _HEAD_BONES if name in ob.vertex_groups}
+            for vert in mesh.vertices:
+                if sum(g.weight for g in vert.groups if g.group in indices) >= 0.5:
+                    core[vert.index] = True
+            corners = np.empty(len(mesh.loops), dtype=np.int32)
+            mesh.loops.foreach_get("vertex_index", corners)
+            owner = np.repeat(np.arange(len(mesh.polygons)), [poly.loop_total for poly in mesh.polygons])
+            for _ring in range(2):
+                flags[:] = 0
+                flags[owner[core[corners]]] = 1
+                core[corners[flags[owner] == 1]] = True
+            flags[:] = 0
+            flags[owner[core[corners]]] = 1
+        attribute = mesh.attributes.get(_HEAD_FACE) or mesh.attributes.new(_HEAD_FACE, 'INT', 'FACE')
+        attribute.data.foreach_set("value", flags)
+
+
+def _delete_faces(mesh, flagged, value):
+    """Remove the faces whose head flag is ``value``, and the vertices only they used."""
+    import bmesh
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bm.faces.ensure_lookup_table()
+    doomed = [bm.faces[index] for index in np.where(flagged == value)[0]]
+    bmesh.ops.delete(bm, geom=doomed, context='FACES')
+    bm.to_mesh(mesh)
+    bm.free()
+
+
+def _split_head(joined, name):
+    """
+    Cut the joined mesh in two: ``joined`` keeps the body and loses its shape keys, the
+    returned object is the head with them.
+
+    The ring of vertices where they meet exists in both, with the same positions and
+    weights because both are copies, and with the normals the uncut mesh had there.
+    """
+    mesh = joined.data
+    count = len(mesh.vertices)
+    flagged = np.empty(len(mesh.polygons), dtype=np.int32)
+    mesh.attributes[_HEAD_FACE].data.foreach_get("value", flagged)
+    mesh.attributes.remove(mesh.attributes[_HEAD_FACE])
+
+    normals = np.empty(count * 3, dtype=np.float32)
+    mesh.vertex_normals.foreach_get("vector", normals)
+    mesh.attributes.new(_VERTEX_NORMAL, 'FLOAT_VECTOR', 'POINT').data.foreach_set("vector", normals)
+    mesh.attributes.new(_VERTEX_ID, 'INT', 'POINT').data.foreach_set("value", np.arange(count, dtype=np.int32))
+
+    head = joined.copy()
+    head.data = mesh.copy()
+    head.name = head.data.name = name + ".head"
+    for collection in joined.users_collection:
+        collection.objects.link(head)
+    _delete_faces(head.data, flagged, 0)
+    joined.shape_key_clear()
+    _delete_faces(mesh, flagged, 1)
+
+    def identities(ob):
+        ids = np.empty(len(ob.data.vertices), dtype=np.int32)
+        ob.data.attributes[_VERTEX_ID].data.foreach_get("value", ids)
+        return ids
+
+    seam = np.intersect1d(identities(head), identities(joined))
+    for ob in (head, joined):
+        part = ob.data
+        on_seam = np.isin(identities(ob), seam)
+        stored = np.empty(len(part.vertices) * 3, dtype=np.float32)
+        part.attributes[_VERTEX_NORMAL].data.foreach_get("vector", stored)
+        corners = np.empty(len(part.loops), dtype=np.int32)
+        part.loops.foreach_get("vertex_index", corners)
+        # A zero normal leaves a corner as it is; only the seam is told what to be.
+        custom = np.zeros((len(part.loops), 3), dtype=np.float32)
+        custom[on_seam[corners]] = stored.reshape(-1, 3)[corners[on_seam[corners]]]
+        part.normals_split_custom_set(custom.tolist())
+        for attribute in (_VERTEX_ID, _VERTEX_NORMAL):
+            part.attributes.remove(part.attributes[attribute])
+    return head, len(seam)
 
 
 # -----------------------------------------------------------------------------
@@ -359,13 +518,134 @@ def _round_trip(path):
     return result
 
 
-def export(rig, path, profile="web", formats=("glb",), keep=False, clips=()):
+def contact_sheet(rig, path, shots=None, view="body", tile=(270, 400), samples=12, columns=6):
+    """
+    Render a person in several poses side by side and save one image: what to look at
+    before believing the numbers.
+
+    A shot is ``(clip, seconds)`` or ``(clip, seconds, {shape key: value})``; the default is
+    every clip of ``motion.CLIPS`` at its telling moment. ``view`` is "body" (three-quarter),
+    "front", "side" or "face", or ``{"target": point, "toward": direction, "scale": metres}``.
+    Rendered on the processor with Cycles in a scene of its own, so nothing else shows.
+    Returns the shots in the order drawn, left to right, top to bottom.
+    """
+    shots = [tuple(shot) for shot in (shots or [(name, motion.SHOWN_AT[name]) for name in motion.CLIPS])]
+    meshes = [ob for ob in rig.children_recursive if ob.type == 'MESH']
+    head = rig.data.bones.get("head")
+    top = max((rig.matrix_world @ Vector(corner)).z for ob in meshes for corner in ob.bound_box) if meshes else 1.7
+
+    scene = bpy.data.scenes.new("_elyan_sheet")
+    made = []
+    try:
+        for ob in [rig] + meshes:
+            scene.collection.objects.link(ob)
+        camera = bpy.data.objects.new("_elyan_sheet_camera", bpy.data.cameras.new("_elyan_sheet_camera"))
+        sun = bpy.data.objects.new("_elyan_sheet_sun", bpy.data.lights.new("_elyan_sheet_sun", 'SUN'))
+        made += [camera, sun]
+        for ob in made:
+            scene.collection.objects.link(ob)
+        camera.data.type = 'ORTHO'
+        if isinstance(view, dict):
+            # A closer look at anything: where to aim, from which side, how many metres tall.
+            target = Vector(view["target"])
+            camera.data.ortho_scale = view.get("scale", 0.5)
+            toward = Vector(view.get("toward", _VIEWS["body"]))
+        elif view == "face" and head is not None:
+            target = rig.matrix_world @ head.head_local + Vector((0.0, 0.0, -0.01))
+            camera.data.ortho_scale = 0.36
+            toward = Vector((0.3, -1.0, 0.05))
+        else:
+            target = Vector((rig.matrix_world.translation.x, rig.matrix_world.translation.y, top * 0.52))
+            camera.data.ortho_scale = top * 1.22
+            toward = _VIEWS.get(view, _VIEWS["body"])
+        camera.location = target + toward.normalized() * 6.0
+        camera.rotation_euler = (target - camera.location).to_track_quat('-Z', 'Y').to_euler()
+        sun.data.energy = 3.0
+        sun.rotation_euler = (math.radians(55.0), 0.0, math.radians(25.0))
+        world = bpy.data.worlds.new("_elyan_sheet")
+        world.use_nodes = True
+        background = world.node_tree.nodes.get("Background")
+        if background is not None:
+            background.inputs[0].default_value = (0.72, 0.72, 0.75, 1.0)
+            background.inputs[1].default_value = 1.0
+        scene.world = world
+        scene.camera = camera
+        scene.render.engine = 'CYCLES'
+        scene.cycles.device = 'CPU'
+        scene.cycles.samples = min(samples, 24)
+        scene.cycles.use_denoising = False
+        scene.render.resolution_x, scene.render.resolution_y = min(tile[0], 540), min(tile[1], 540)
+        scene.render.resolution_percentage = 100
+        scene.render.image_settings.file_format = 'PNG'
+
+        width, height = scene.render.resolution_x, scene.render.resolution_y
+        columns = min(columns, len(shots))
+        rows = -(-len(shots) // columns)
+        sheet = np.ones((rows * height, columns * width, 4), dtype=np.float32)
+        stem = os.path.splitext(os.path.abspath(path))[0]
+        for number, shot in enumerate(shots):
+            motion.show(rig, shot[0], shot[1])
+            values = shot[2] if len(shot) > 2 else {}
+            for ob in meshes:
+                if ob.data.shape_keys:
+                    for block in ob.data.shape_keys.key_blocks[1:]:
+                        if face.is_face_key(block.name):
+                            block.value = values.get(block.name, 0.0)
+            scene.render.filepath = "{:s}.tile{:02d}.png".format(stem, number)
+            bpy.ops.render.render(write_still=True, scene=scene.name)
+            image = bpy.data.images.load(scene.render.filepath)
+            pixels = np.empty(width * height * 4, dtype=np.float32)
+            image.pixels.foreach_get(pixels)
+            bpy.data.images.remove(image)
+            os.remove(scene.render.filepath)
+            # Image rows run bottom to top, the sheet reads top to bottom.
+            row, column = rows - 1 - number // columns, number % columns
+            sheet[row * height:(row + 1) * height, column * width:(column + 1) * width] = pixels.reshape(
+                height, width, 4)
+        result = bpy.data.images.new("_elyan_sheet", columns * width, rows * height, alpha=True)
+        result.pixels.foreach_set(sheet.ravel())
+        result.filepath_raw = path
+        result.file_format = 'PNG'
+        result.save()
+        bpy.data.images.remove(result)
+    finally:
+        motion._pose(rig, [])
+        for ob in meshes:
+            if ob.data.shape_keys:
+                for block in ob.data.shape_keys.key_blocks[1:]:
+                    if face.is_face_key(block.name):
+                        block.value = 0.0
+        for ob in made:
+            data = ob.data
+            bpy.data.objects.remove(ob)
+            (bpy.data.cameras if isinstance(data, bpy.types.Camera) else bpy.data.lights).remove(data)
+        world = scene.world
+        bpy.data.scenes.remove(scene)
+        if world is not None:
+            bpy.data.worlds.remove(world)
+    return [list(shot[:2]) for shot in shots]
+
+
+def export(rig, path, profile="web", formats=("glb",), keep=False, clips=(), split_head=None, sheet=False):
     """
     Write ``path`` (extension is replaced per format) for a delivery profile.
 
     ``clips`` names body motions from ``motion.CLIPS`` to include as animations.
+    ``split_head`` keeps the head, with the face shapes, apart from the body, so shapes
+    are stored for the head's vertices only; by default the web profile does. ``sheet``
+    also renders a contact sheet of the clips (slow: Cycles on the processor).
     Returns a manifest, also saved beside the files as ``<name>.manifest.json``.
     """
+    timings = {}
+    started = [time.perf_counter()]
+
+    def lap(stage):
+        now = time.perf_counter()
+        timings[stage] = round(timings.get(stage, 0.0) + now - started[0], 3)
+        started[0] = now
+
+    if split_head is None:
+        split_head = profile == "web"
     limits = _validate.PROFILES[profile] if _validate else {"triangles": _FALLBACK_BUDGET[profile]}
     export_service = build.mpfb("services.exportservice", "ExportService")
     object_service = build.mpfb("services.objectservice", "ObjectService")
@@ -383,18 +663,24 @@ def export(rig, path, profile="web", formats=("glb",), keep=False, clips=()):
     for ob, _kind in parts:
         for modifier in [m for m in ob.modifiers if m.type != 'ARMATURE']:
             ob.modifiers.remove(modifier)
+    lap("copy")
 
     available = [
         block.name for block in (basemesh.data.shape_keys.key_blocks if basemesh.data.shape_keys else ())
         if face.is_face_key(block.name) and block.value == 0.0
     ]
     wanted = set(face.keys_for(profile, available))
-    rename = face.VRCHAT_NAMES if profile in {"quest", "vrchat_pc"} else {}
+    rename = face.VRCHAT_NAMES if profile in _VRCHAT else {}
     settled = [(ob, _settle_shape_keys(ob, wanted)) for ob, _kind in parts]
     before = sum(_triangles(ob.data) for ob, _kind in parts)
     _fit_budget(parts, limits["triangles"])
+    lap("reduce")
     for ob, state in settled:
         _restore_shape_keys(ob, state, rename)
+    nudged = None
+    if profile in _VRCHAT and "viseme_sil" in wanted:
+        nudged = _nudge_silence(parts, rename["viseme_sil"])
+    lap("shape_keys")
 
     size = min(limits.get("texture_size", 2048), 2048)
     name = build.stored(rig)["recipe"]["name"] + "_" + profile
@@ -404,15 +690,24 @@ def export(rig, path, profile="web", formats=("glb",), keep=False, clips=()):
         ob.data.materials.clear()
         ob.data.materials.append(material)
         _clean_weights(ob, export_rig)
+    lap("atlas")
 
+    if split_head:
+        _mark_head(parts)
     _select_only([ob for ob, _kind in parts], basemesh)
     bpy.ops.object.join()
     # Joining leaves merged shape keys switched on; a rest face has them all off.
     if basemesh.data.shape_keys:
         for block in basemesh.data.shape_keys.key_blocks[1:]:
             block.value = 0.0
-    basemesh.name = name
+    basemesh.name = basemesh.data.name = name
     export_rig.name = name + ".rig"
+    meshes = [basemesh]
+    seam = 0
+    if split_head:
+        head, seam = _split_head(basemesh, name)
+        meshes = [head, basemesh]
+    lap("join")
 
     folder = os.path.dirname(os.path.abspath(path))
     os.makedirs(folder, exist_ok=True)
@@ -422,7 +717,8 @@ def export(rig, path, profile="web", formats=("glb",), keep=False, clips=()):
     atlas.save()
 
     animations = motion.add_clips(export_rig, clips) if clips else []
-    _select_only([basemesh, export_rig], export_rig)
+    lap("clips")
+    _select_only(meshes + [export_rig], export_rig)
     files = {}
     if "glb" in formats:
         files["glb"] = stem + ".glb"
@@ -432,13 +728,23 @@ def export(rig, path, profile="web", formats=("glb",), keep=False, clips=()):
             export_animations=bool(animations), export_animation_mode='NLA_TRACKS',
             export_morph_animation=False, export_force_sampling=True,
         )
+        lap("write_glb")
     if "fbx" in formats:
         files["fbx"] = stem + ".fbx"
+        # The FBX exporter bakes one take per strip but passes over muted tracks, which is
+        # how the clips are parked; they are unmuted just for it.
+        tracks = list(export_rig.animation_data.nla_tracks) if export_rig.animation_data else []
+        for track in tracks:
+            track.mute = False
         bpy.ops.export_scene.fbx(
             filepath=files["fbx"], use_selection=True, add_leaf_bones=False,
             object_types={'ARMATURE', 'MESH'}, bake_anim=bool(animations), bake_anim_use_all_actions=False,
             bake_anim_use_nla_strips=True, path_mode='COPY', embed_textures=True,
         )
+        for track in tracks:
+            track.mute = True
+        motion._pose(export_rig, [])
+        lap("write_fbx")
 
     manifest = {
         "schema": "elyan.person.export/1",
@@ -446,20 +752,44 @@ def export(rig, path, profile="web", formats=("glb",), keep=False, clips=()):
         "recipe": build.stored(rig)["recipe"],
         "contract": build.stored(rig)["contract"],
         "triangles_before": before,
+        "meshes": [
+            {
+                "name": ob.name, "triangles": _triangles(ob.data), "vertices": len(ob.data.vertices),
+                "shape_keys": len(ob.data.shape_keys.key_blocks) - 1 if ob.data.shape_keys else 0,
+            } for ob in meshes
+        ],
+        "split_head": bool(split_head),
+        "seam_vertices": seam,
         "shape_keys": sorted(rename.get(name, name) for name in wanted),
         "animations": animations,
         "atlas": {"file": atlas.filepath_raw, "size": size},
         "files": {key: {"path": value, "bytes": os.path.getsize(value)} for key, value in files.items()},
     }
+    if nudged:
+        manifest["silence_nudge"] = {"part": nudged, "metres": face.SILENCE_NUDGE}
     if _validate:
-        report = _validate.validate([basemesh, export_rig], profile)
+        report = _validate.validate(meshes + [export_rig], profile)
         manifest["validation"] = {key: report[key] for key in ("totals", "limits", "failures", "passed")}
+        lap("validate")
     if "glb" in files:
         manifest["round_trip"] = _round_trip(files["glb"])
+        lap("round_trip")
+    if sheet:
+        manifest["contact_sheet"] = {
+            "path": stem + ".sheet.png",
+            "shots": contact_sheet(
+                export_rig, stem + ".sheet.png",
+                [(clip, motion.SHOWN_AT[clip]) for clip in (animations or motion.CLIPS)]),
+        }
+        lap("contact_sheet")
+    manifest["timings"] = timings
     with open(stem + ".manifest.json", "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=1)
 
     if not keep:
-        for ob in (basemesh, export_rig):
+        tracks = export_rig.animation_data.nla_tracks if export_rig.animation_data else ()
+        for action in {strip.action for track in tracks for strip in track.strips if strip.action}:
+            bpy.data.actions.remove(action)
+        for ob in meshes + [export_rig]:
             bpy.data.objects.remove(ob)
     return manifest

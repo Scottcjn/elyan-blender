@@ -8,8 +8,13 @@ Bridge commands. Everything here runs on Blender's main thread.
 
 import ast
 import contextlib
+import importlib
+import importlib.util
 import io
+import json
 import os
+import runpy
+import sys
 import time
 import traceback
 
@@ -17,6 +22,15 @@ import bpy
 
 MAX_TEXT = 200_000
 MAX_ITEMS = 2000
+
+# Answered by the server itself, off the main thread, so they work while a job runs.
+JOB_COMMANDS = ("submit", "status", "result", "cancel", "jobs")
+
+# Custom properties that tie a checkpoint copy to what it was copied from.
+_KEY_SOURCE = "elyan_checkpoint_source"
+_KEY_DATA = "elyan_checkpoint_data"
+_KEY_COLLECTIONS = "elyan_checkpoint_collections"
+_KEY_TIME = "elyan_checkpoint_time"
 
 # Set by ``server.serve()`` so the ``quit`` command can end a headless session.
 quit_callback = None
@@ -118,7 +132,7 @@ def cmd_ping(args):
         "background": bpy.app.background,
         "pid": os.getpid(),
         "generation": generation,
-        "commands": sorted(COMMANDS),
+        "commands": sorted((*COMMANDS, *JOB_COMMANDS)),
     }
 
 
@@ -128,10 +142,12 @@ def cmd_exec(args):
 
     The namespace persists between calls; pass ``reset`` to clear it. It is also
     cleared by undo, redo and loading a file: ``generation`` in the reply changes.
+    ``diff`` adds what the code changed in the scene, see ``cmd_diff``.
     """
     code = args.get("code")
     if not isinstance(code, str) or not code.strip():
         raise ValueError("exec needs 'code'")
+    before = _state_before(args)
     if args.get("reset"):
         _namespace.clear()
     _namespace.setdefault("bpy", bpy)
@@ -158,18 +174,316 @@ def cmd_exec(args):
     response["undo_pushed"] = _undo_push("LLM: " + (args.get("label") or code.strip().splitlines()[0][:60]))
     response["generation"] = generation
     response["mode"] = bpy.context.mode
+    _state_after(before, response)
     return response
+
+
+def _state_before(args):
+    if not args.get("diff"):
+        return None
+    from . import checks
+    return checks.scene_state()
+
+
+def _state_after(before, response):
+    if before is None:
+        return
+    from . import checks
+    try:
+        response["diff"] = checks.diff_states(before, checks.scene_state())
+    except Exception:
+        # The code ran; failing to describe its effect must not hide its own outcome.
+        response["diff_error"] = traceback.format_exc()
+
+
+def _under(path, root):
+    try:
+        return os.path.commonpath([os.path.realpath(path), root]) == root
+    except ValueError:
+        return False
+
+
+def _purge_modules(root):
+    """Forget every imported module whose source lives under ``root``. Returns their names."""
+    purged = []
+    for name, module in list(sys.modules.items()):
+        if name == "__main__" or name.split(".")[0] == __package__:
+            continue
+        source = getattr(module, "__file__", None)
+        if not source or not _under(source, root):
+            continue
+        # Compiled files are matched to their source by whole seconds and size, which
+        # misses a quick small edit. Dropping them makes the source the only truth.
+        try:
+            os.remove(importlib.util.cache_from_source(source))
+        except (OSError, ValueError, NotImplementedError):
+            pass
+        del sys.modules[name]
+        purged.append(name)
+    importlib.invalidate_caches()
+    return sorted(purged)
+
+
+def cmd_rebuild(args):
+    """
+    Run a builder script as ``blender --python`` would, but in this session.
+
+    The script gets a fresh ``__main__`` namespace, its own ``__file__``, and its
+    folder first on ``sys.path``. Modules already imported from that folder tree
+    (``root`` widens or narrows it) are forgotten first, so an edited
+    ``contract.py`` beside the script takes effect instead of the cached import.
+    ``argv`` is passed on as ``sys.argv[1:]``; ``diff`` reports what changed.
+    """
+    path = args.get("path")
+    if not path:
+        raise ValueError("rebuild needs 'path'")
+    path = os.path.realpath(os.path.expanduser(path))
+    if not os.path.isfile(path):
+        raise ValueError("no script at {:s}".format(path))
+    folder = os.path.dirname(path)
+    root = os.path.realpath(os.path.expanduser(args.get("root") or folder))
+    # Forgetting the standard library or this bridge would break the session.
+    for keep in (os.__file__, __file__, bpy.__file__ or __file__):
+        if _under(keep, root):
+            raise ValueError("refusing to reload everything under {:s}: it contains {:s}".format(root, keep))
+    before = _state_before(args)
+
+    purged = _purge_modules(root)
+    known = set(sys.modules)
+    saved_argv, saved_path, saved_bytecode = sys.argv, list(sys.path), sys.dont_write_bytecode
+    out = io.StringIO()
+    response = {"path": path, "root": root}
+    started = time.time()
+    try:
+        sys.argv = [path] + [str(arg) for arg in args.get("argv") or ()]
+        sys.path.insert(0, folder)
+        sys.dont_write_bytecode = True
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            namespace = runpy.run_path(path, run_name="__main__")
+        response["result"] = _jsonable(namespace.get("result"))
+    except SystemExit as ex:
+        # Builders written for ``blender -b --python`` often end with ``sys.exit(0)``.
+        if ex.code not in {None, 0}:
+            response["ok"] = False
+            response["error"] = "the script exited with {!r}\n{:s}".format(ex.code, traceback.format_exc())
+    except Exception:
+        response["ok"] = False
+        response["error"] = traceback.format_exc()
+    finally:
+        sys.argv = saved_argv
+        sys.path[:] = saved_path
+        sys.dont_write_bytecode = saved_bytecode
+    loaded = {
+        name for name, module in sys.modules.items()
+        if name not in known and _under(getattr(module, "__file__", None) or os.sep, root)
+    }
+    response["seconds"] = round(time.time() - started, 2)
+    response["stdout"] = _clip(out.getvalue())
+    response["reloaded"] = sorted(loaded.intersection(purged))
+    response["imported"] = sorted(loaded.difference(purged))
+    response["purged_not_reimported"] = sorted(set(purged).difference(loaded))
+    response["undo_pushed"] = _undo_push("LLM rebuild: " + os.path.basename(path))
+    response["generation"] = generation
+    response["mode"] = bpy.context.mode
+    _state_after(before, response)
+    return response
+
+
+def _require_object_mode(what):
+    # Edit-mode changes live outside the mesh until the mode is left, a copy would miss them.
+    if bpy.context.mode != 'OBJECT':
+        raise RuntimeError("{:s} needs Object Mode, Blender is in {:s}".format(what, bpy.context.mode))
+
+
+def _checkpoint_collection(name):
+    from . import checks
+    if not isinstance(name, str) or not name:
+        raise ValueError("a checkpoint needs 'name'")
+    return checks.CHECKPOINT_PREFIX + name
+
+
+def _copy_objects(objects):
+    """
+    Copy objects together with their data. Returns ``{source name: copy}``.
+
+    Parents, modifier targets and constraint targets that point at another
+    copied object are moved to its copy, so the set stays self-contained.
+    Actions and materials are shared, not copied.
+    """
+    data_copies, copies = {}, {}
+    for ob in objects:
+        new = ob.copy()
+        if ob.data is not None:
+            # Objects sharing one mesh keep sharing one.
+            key = (type(ob.data).__name__, ob.data.name)
+            if key not in data_copies:
+                data_copies[key] = ob.data.copy()
+            new.data = data_copies[key]
+        copies[ob.name] = new
+    for new in copies.values():
+        if new.parent is not None and new.parent.name in copies:
+            new.parent = copies[new.parent.name]
+        for owner in (*new.modifiers, *new.constraints):
+            for prop in owner.bl_rna.properties:
+                if prop.type != 'POINTER' or prop.is_readonly:
+                    continue
+                target = getattr(owner, prop.identifier)
+                if isinstance(target, bpy.types.Object) and target.name in copies:
+                    setattr(owner, prop.identifier, copies[target.name])
+    return copies
+
+
+def _remove_objects(objects):
+    """Delete objects, and their data when nothing else uses it."""
+    data = {ob.data for ob in objects if ob.data is not None}
+    for ob in objects:
+        bpy.data.objects.remove(ob, do_unlink=True)
+    orphans = [block for block in data if block.users == 0]
+    if orphans:
+        bpy.data.batch_remove(orphans)
+
+
+def _drop_checkpoint(collection):
+    _remove_objects(list(collection.objects))
+    bpy.data.collections.remove(collection)
+
+
+def _checkpoint_info(collection):
+    from . import checks
+    return {
+        "name": collection.name[len(checks.CHECKPOINT_PREFIX):],
+        "collection": collection.get(_KEY_SOURCE),
+        "objects": sorted(ob.get(_KEY_SOURCE, ob.name) for ob in collection.objects),
+        "time": collection.get(_KEY_TIME),
+    }
+
+
+def cmd_checkpoint(args):
+    """
+    Keep a copy of a collection's objects under ``name``, to return to with ``rollback``.
+
+    The copies live in the hidden collection ``_checkpoint_<name>``, excluded from
+    every view layer, so nothing is saved to disk and nothing renders or exports.
+    Objects in child collections are included. ``replace`` overwrites the name.
+    """
+    from . import checks
+    _require_object_mode("checkpoint")
+    store_name = _checkpoint_collection(args.get("name"))
+    source = bpy.data.collections.get(args.get("collection") or "")
+    if source is None:
+        raise ValueError("checkpoint needs 'collection', the name of an existing collection")
+    if source.name.startswith(checks.CHECKPOINT_PREFIX):
+        raise ValueError("a checkpoint cannot be checkpointed")
+    existing = bpy.data.collections.get(store_name)
+    if existing is not None:
+        if not args.get("replace"):
+            raise ValueError("checkpoint {!r} exists; pass 'replace' to overwrite it".format(args["name"]))
+        _drop_checkpoint(existing)
+
+    objects = list(source.all_objects)
+    store = bpy.data.collections.new(store_name)
+    store[_KEY_SOURCE] = source.name
+    store[_KEY_TIME] = time.strftime("%Y-%m-%d %H:%M:%S")
+    for name, copy in _copy_objects(objects).items():
+        original = bpy.data.objects[name]
+        copy[_KEY_SOURCE] = name
+        if original.data is not None:
+            copy[_KEY_DATA] = original.data.name
+        copy[_KEY_COLLECTIONS] = json.dumps([c.name for c in original.users_collection])
+        store.objects.link(copy)
+    # Linked into the scene so it survives as long as the file is open, then switched off everywhere.
+    scene = bpy.context.scene
+    scene.collection.children.link(store)
+    store.hide_viewport = True
+    store.hide_render = True
+    for view_layer in scene.view_layers:
+        view_layer.layer_collection.children[store.name].exclude = True
+    return _checkpoint_info(store)
+
+
+def cmd_rollback(args):
+    """
+    Put a collection back as it was at ``checkpoint`` time.
+
+    Objects made since are deleted, objects deleted since return, the others are
+    replaced by fresh copies of the stored ones under their old names. Whatever
+    pointed at a replaced object (parents, modifiers, other collections) now
+    points at its replacement. The checkpoint stays, so this can be repeated.
+    """
+    _require_object_mode("rollback")
+    store = bpy.data.collections.get(_checkpoint_collection(args.get("name")))
+    if store is None:
+        raise ValueError("no checkpoint named {!r}".format(args.get("name")))
+    source = bpy.data.collections.get(store[_KEY_SOURCE])
+    if source is None:
+        # The whole collection was deleted since; bring it back too.
+        source = bpy.data.collections.new(store[_KEY_SOURCE])
+        bpy.context.scene.collection.children.link(source)
+
+    current = {ob.name: ob for ob in source.all_objects}
+    stored = list(store.objects)
+    copies = _copy_objects(stored)
+    restored = []
+    for kept in stored:
+        new = copies[kept.name]
+        name = kept[_KEY_SOURCE]
+        data_name = kept.get(_KEY_DATA)
+        homes = json.loads(kept.get(_KEY_COLLECTIONS, "[]"))
+        for key in (_KEY_SOURCE, _KEY_DATA, _KEY_COLLECTIONS):
+            if key in new:
+                del new[key]
+        old = current.pop(name, None)
+        if old is not None:
+            # Everything that used the old object uses the restored one, collections included.
+            old.user_remap(new)
+            _remove_objects([old])
+        if not new.users_collection:
+            homes = [bpy.data.collections[home] for home in homes if home in bpy.data.collections]
+            for home in homes or [source]:
+                home.objects.link(new)
+        new.name = name
+        if new.data is not None and data_name:
+            new.data.name = data_name
+        restored.append(name)
+    removed = sorted(current)
+    _remove_objects(list(current.values()))
+    bpy.context.view_layer.update()
+    return {
+        "name": args["name"],
+        "collection": source.name,
+        "restored": sorted(restored),
+        "removed": removed,
+        "undo_pushed": _undo_push("LLM rollback: " + args["name"]),
+    }
+
+
+def cmd_checkpoints(args):
+    """List checkpoints; ``delete`` removes the named one first."""
+    from . import checks
+    if args.get("delete"):
+        _require_object_mode("deleting a checkpoint")
+        store = bpy.data.collections.get(_checkpoint_collection(args["delete"]))
+        if store is None:
+            raise ValueError("no checkpoint named {!r}".format(args["delete"]))
+        _drop_checkpoint(store)
+    return {"checkpoints": [
+        _checkpoint_info(collection) for collection in bpy.data.collections
+        if collection.name.startswith(checks.CHECKPOINT_PREFIX)
+    ]}
 
 
 def cmd_scene(args):
     """Overview of the scene: one compact record per object."""
+    from . import checks
     scene = bpy.context.scene
     view_layer = bpy.context.view_layer
     limit = int(args.get("limit") or 500)
     objects = []
     total_tris = 0
     depsgraph = bpy.context.evaluated_depsgraph_get()
-    for ob in scene.objects[:limit]:
+    # Checkpoint copies are storage, not scene content.
+    listed = [ob for ob in scene.objects if not checks.is_checkpoint_object(ob)]
+    for ob in listed[:limit]:
         item = {
             "name": ob.name,
             "type": ob.type,
@@ -212,8 +526,8 @@ def cmd_scene(args):
         "unit_scale": scene.unit_settings.scale_length,
         "render_engine": scene.render.engine,
         "camera": scene.camera.name if scene.camera else None,
-        "object_count": len(scene.objects),
-        "objects_truncated": len(scene.objects) > limit,
+        "object_count": len(listed),
+        "objects_truncated": len(listed) > limit,
         "mesh_tris_listed": total_tris,
         "objects": objects,
     }
@@ -440,7 +754,7 @@ def cmd_validate(args):
     ``names`` lists the objects; without it the selection is used, or failing that
     every mesh in the scene. A rig given by name brings its skinned meshes along.
     """
-    from . import validate
+    from . import checks, validate
     profile = args.get("profile") or "web"
     if profile not in validate.PROFILES:
         raise ValueError("unknown profile {!r}; known: {:s}".format(profile, ", ".join(sorted(validate.PROFILES))))
@@ -449,8 +763,72 @@ def cmd_validate(args):
         objects = [bpy.data.objects[name] for name in names]
         objects += [child for ob in objects if ob.type == 'ARMATURE' for child in ob.children_recursive]
     else:
-        objects = list(bpy.context.selected_objects) or [ob for ob in bpy.context.scene.objects if ob.type == 'MESH']
+        objects = list(bpy.context.selected_objects) or [
+            ob for ob in bpy.context.scene.objects if ob.type == 'MESH' and not checks.is_checkpoint_object(ob)]
     return validate.validate(objects, profile)
+
+
+def cmd_check(args):
+    """
+    Numeric geometry checks that fail closed; ``passed`` is true only if ``failures`` is empty.
+
+    ``names`` lists mesh objects (default: the selection, else every mesh). For
+    each: triangles after modifiers, material slots, non-manifold and wire edges,
+    boundary edges and loops, loose vertices, zero-area faces, unapplied scale.
+    Defects are counted after modifiers unless ``evaluated`` is false.
+
+    ``budgets``: ``{"triangles": N, "material_slots": N, ...}`` against the totals.
+    ``boundary_loops``: ``{object: expected count}``.
+    ``seam``: ``{"object": A, "points": [[x, y, z], ...]}`` or ``{"object": A, "group": G,
+    "other": B, "other_group": H}``, optional ``tolerance`` (1e-5): the distance from each
+    target point to A's nearest open-boundary vertex, as ``max`` and ``rms``, unrounded.
+    ``clearance``: ``{"garment": G, "body": B, "threshold": T, "ignore_groups": [...],
+    "samples": N, "max_below": 0}``: signed distance of garment vertices to the body
+    surface (negative inside), as ``min``, ``percentile_5`` and the count below ``threshold``.
+    ``seam`` and ``clearance`` also take lists.
+    """
+    from . import checks
+    return checks.check(args)
+
+
+def cmd_snapshot(args):
+    """Remember the scene's state under ``name`` for a later ``diff``."""
+    from . import checks
+    name = args.get("name")
+    if not isinstance(name, str) or not name:
+        raise ValueError("snapshot needs 'name'")
+    state = checks.snapshot(name)
+    return {"name": name, "objects": len(state), "snapshots": checks.snapshot_names()}
+
+
+def cmd_diff(args):
+    """
+    What changed since snapshot ``name``, or between it and snapshot ``to``.
+
+    Objects are compared by evaluated vertex and triangle counts, vertex positions,
+    world bounding box, material names, modifier types and world transform.
+    """
+    from . import checks
+    before = checks.stored(args.get("name"))
+    after = checks.stored(args["to"]) if args.get("to") else checks.scene_state()
+    response = checks.diff_states(before, after)
+    response["from"] = args["name"]
+    response["to"] = args.get("to") or "now"
+    return response
+
+
+def cmd_contact_sheet(args):
+    """
+    Render fixed views of ``names`` (objects, with their children) into one labelled PNG at ``path``.
+
+    ``views`` defaults to front, back, left, right and three_quarter ("top" also exists).
+    ``closeup``: ``{"armature": RIG, "bone": BONE}`` or ``{"object": NAME}``, with optional
+    ``size`` (width shown, in scene units) and ``view``. ``tile`` is the size of one view in
+    pixels (at most 400), ``samples`` at most 24, ``columns`` the grid width.
+    Rendered with Cycles on the CPU in a temporary scene; the artist's scene is not touched.
+    """
+    from . import sheet
+    return sheet.contact_sheet(args)
 
 
 def cmd_quit(args):
@@ -464,6 +842,14 @@ def cmd_quit(args):
 COMMANDS = {
     "ping": cmd_ping,
     "exec": cmd_exec,
+    "rebuild": cmd_rebuild,
+    "checkpoint": cmd_checkpoint,
+    "rollback": cmd_rollback,
+    "checkpoints": cmd_checkpoints,
+    "check": cmd_check,
+    "snapshot": cmd_snapshot,
+    "diff": cmd_diff,
+    "contact_sheet": cmd_contact_sheet,
     "scene": cmd_scene,
     "object": cmd_object,
     "render": cmd_render,
@@ -493,7 +879,9 @@ def summarize(cmd, args):
     if cmd == "exec":
         code = (args.get("code") or "").strip()
         return args.get("label") or (code.splitlines()[0][:48] if code else "")
-    for key in ("name", "path", "query", "label"):
+    if cmd == "submit":
+        return "{!s} {:s}".format(args.get("cmd"), summarize(str(args.get("cmd")), args.get("args") or {})).strip()
+    for key in ("name", "path", "query", "label", "job"):
         if args.get(key):
             return str(args[key])[-48:]
     return ""

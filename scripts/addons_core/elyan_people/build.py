@@ -14,6 +14,7 @@ import importlib
 import json
 import os
 import sys
+import time
 
 import bpy
 import numpy as np
@@ -64,6 +65,20 @@ def _asset(folder, name, extension):
             "no {:s} asset named {!r}; install the MakeHuman system assets pack "
             "or check the name".format(folder, name))
     return path
+
+
+def list_assets():
+    """
+    Names a recipe may use, by recipe key, as installed here: ``{"skin": [...], "hair": [...],
+    "clothes": [...], "eyes": [...], ...}``. A name is an asset file's name without extension.
+    """
+    asset_service = mpfb("services.assetservice", "AssetService")
+    result = {"skin": sorted({path.stem for path in asset_service.list_mhmat_assets("skins")})}
+    for key, folder, _asset_type in _PARTS + (("clothes", "clothes", "Clothes"),):
+        result[key] = sorted({path.stem for path in asset_service.list_mhclo_assets(folder)})
+    result["rig"] = list(recipe_module.RIGS)
+    result["face"] = list(recipe_module.FACES)
+    return result
 
 
 def _mixed_coordinates(basemesh):
@@ -159,6 +174,7 @@ def build(recipe):
     The normalized recipe and the measured contract are stored on the rig as JSON
     in the ``elyan_person`` custom property.
     """
+    started = time.perf_counter()
     recipe = recipe_module.normalize(recipe)
     human_service = mpfb("services.humanservice", "HumanService")
     target_service = mpfb("services.targetservice", "TargetService")
@@ -211,6 +227,7 @@ def build(recipe):
         basemesh=basemesh.name,
         objects=sorted(child.name for child in rig.children_recursive),
         contract=contract,
+        seconds=round(time.perf_counter() - started, 3),
     )
     return rig, report
 
