@@ -3,15 +3,16 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 """
-Scenery: fractal terrain with erosion, one-click skies, water, rocks and
-organic blobs, in the spirit of the landscape programs of the 1990s.
+Scenery: fractal terrain with erosion, one-click skies with distance haze,
+water, rocks, trees, scattering and organic blobs, in the spirit of the
+landscape programs of the 1990s.
 """
 
 bl_info = {
     "name": "Elyan Scenery",
-    "description": "Fractal terrain, erosion, skies, water and organic forms, with one-click landscapes",
+    "description": "Fractal terrain, erosion, skies, haze, water, trees and scattering, with one-click landscapes",
     "author": "Elyan Labs",
-    "version": (0, 1),
+    "version": (0, 2),
     "blender": (4, 2, 0),
     "location": "3D Viewport -> Sidebar -> Scenery, and Add -> Scenery",
     "support": "OFFICIAL",
@@ -22,7 +23,7 @@ import bpy
 from bpy.props import PointerProperty
 from bpy.types import Menu, Panel
 
-from . import objects, sky, terrain
+from . import instant, objects, scatter, sky, terrain, trees
 
 
 class _SceneryPanel:
@@ -43,6 +44,7 @@ class ELYAN_PT_scenery_create(_SceneryPanel, Panel):
         col.operator("elyan_scenery.terrain_add", icon='RNDCURVE')
         col.operator("elyan_scenery.water_add", icon='MOD_OCEAN')
         col.operator("elyan_scenery.rock_add", icon='MESH_ICOSPHERE')
+        col.operator_menu_enum("elyan_scenery.tree_add", "species", icon='STRANDS')
         col.operator("elyan_scenery.blob_add", icon='META_BALL')
 
 
@@ -86,6 +88,9 @@ class ELYAN_PT_scenery_terrain(_SceneryPanel, Panel):
         col.operator("elyan_scenery.terrain_from_image", icon='IMPORT')
 
         col = layout.column(align=True)
+        col.label(text="Cover")
+        # Choosing what to scatter loads rules that suit it; they can be changed in the redo panel.
+        col.operator_menu_enum("elyan_scenery.scatter", "what", icon='PARTICLES')
         col.operator_menu_enum("elyan_scenery.terrain_material", "material", icon='MATERIAL')
         col.operator("elyan_scenery.terrain_resample", icon='MOD_MULTIRES')
 
@@ -113,8 +118,13 @@ class ELYAN_MT_scenery_add(Menu):
         layout.operator("elyan_scenery.terrain_add", icon='RNDCURVE')
         layout.operator("elyan_scenery.water_add", icon='MOD_OCEAN')
         layout.operator("elyan_scenery.rock_add", icon='MESH_ICOSPHERE')
+        layout.operator_menu_enum("elyan_scenery.tree_add", "species", icon='STRANDS')
         layout.operator("elyan_scenery.blob_add", icon='META_BALL')
-        layout.operator("elyan_scenery.sky_set", icon='LIGHT_SUN')
+        layout.separator()
+        # Greyed out unless a terrain is active.
+        layout.operator_menu_enum("elyan_scenery.scatter", "what", icon='PARTICLES')
+        layout.separator()
+        layout.operator_menu_enum("elyan_scenery.sky_set", "preset", icon='LIGHT_SUN')
 
 
 def _add_menu(self, _context):
@@ -125,6 +135,9 @@ classes = (
     *terrain.classes,
     *sky.classes,
     *objects.classes,
+    *trees.classes,
+    *scatter.classes,
+    *instant.classes,
     ELYAN_PT_scenery_create,
     ELYAN_PT_scenery_terrain,
     ELYAN_PT_scenery_sky,

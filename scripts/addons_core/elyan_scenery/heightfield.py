@@ -317,3 +317,26 @@ def sample(grid, u, v):
     top = grid[iy, ix] * (1 - fx) + grid[iy, ix + 1] * fx
     bottom = grid[iy + 1, ix] * (1 - fx) + grid[iy + 1, ix + 1] * fx
     return float(top * (1 - fy) + bottom * fy)
+
+
+def sample_many(grid, u, v):
+    """Heights at arrays of ``u``, ``v`` in 0..1 (x, y)."""
+    n = grid.shape[0]
+    x = np.clip(u, 0.0, 1.0) * (n - 1)
+    y = np.clip(v, 0.0, 1.0) * (n - 1)
+    ix = np.minimum(x.astype(np.int32), n - 2)
+    iy = np.minimum(y.astype(np.int32), n - 2)
+    fx, fy = x - ix, y - iy
+    top = grid[iy, ix] * (1 - fx) + grid[iy, ix + 1] * fx
+    bottom = grid[iy + 1, ix] * (1 - fx) + grid[iy + 1, ix + 1] * fx
+    return top * (1 - fy) + bottom * fy
+
+
+def slope(grid, run):
+    """
+    Steepness of every cell as rise over run (1 is 45 degrees).
+
+    ``run`` is the distance between neighbouring points, in the unit of the heights.
+    """
+    dy, dx = np.gradient(grid.astype(np.float32), run)
+    return np.hypot(dx, dy)

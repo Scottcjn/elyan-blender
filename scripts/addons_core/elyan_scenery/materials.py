@@ -3,20 +3,27 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 """
-Procedural materials: terrain coloured by altitude and slope, water, rock, clay.
+Procedural materials: terrain coloured by altitude and slope, water, rock, clay,
+bark and leaves.
 
 Materials are shared by name, asking twice for the same preset returns the same one.
+Every material ends in the shared haze node group, which the sky fills in so that
+distance fades all of them toward the horizon together.
 """
 
 import bpy
 
+HAZE_GROUP = "Scenery Haze"
+
 # Colours are (shore, lowland, upland, peak, cliff); lines are the altitudes (0..1)
 # where lowland, upland and peak colours take over.
+# Snow is kept well short of white: in full sun anything brighter clips, and with it goes
+# the shading that shows the shape of the land.
 TERRAIN_PRESETS = {
     'ALPINE': {
         "label": "Alpine",
-        "colors": ((0.20, 0.17, 0.12), (0.07, 0.16, 0.04), (0.19, 0.17, 0.14), (0.85, 0.87, 0.90), (0.13, 0.12, 0.11)),
-        "lines": (0.08, 0.45, 0.72), "cliff": 0.9, "roughness": 0.85,
+        "colors": ((0.16, 0.13, 0.08), (0.04, 0.13, 0.02), (0.10, 0.085, 0.065), (0.80, 0.83, 0.88), (0.06, 0.055, 0.05)),
+        "lines": (0.06, 0.46, 0.70), "cliff": 0.9, "roughness": 0.85,
     },
     'DESERT': {
         "label": "Desert",
@@ -30,8 +37,8 @@ TERRAIN_PRESETS = {
     },
     'ARCTIC': {
         "label": "Arctic",
-        "colors": ((0.30, 0.40, 0.48), (0.55, 0.62, 0.70), (0.66, 0.71, 0.77), (0.78, 0.80, 0.83), (0.16, 0.20, 0.25)),
-        "lines": (0.05, 0.30, 0.60), "cliff": 0.6, "roughness": 0.55,
+        "colors": ((0.07, 0.10, 0.13), (0.26, 0.33, 0.40), (0.46, 0.52, 0.60), (0.60, 0.64, 0.70), (0.035, 0.045, 0.06)),
+        "lines": (0.06, 0.34, 0.62), "cliff": 0.95, "roughness": 0.6,
     },
     'TROPICAL': {
         "label": "Tropical",
@@ -49,6 +56,9 @@ TERRAIN_PRESETS = {
         "lines": (0.10, 0.45, 0.80), "cliff": 0.8, "roughness": 0.6,
     },
 }
+
+# Altitude over which one band's colour gives way to the next.
+BAND_BLEND = 0.07
 
 TERRAIN_ITEMS = tuple((key, preset["label"], "") for key, preset in TERRAIN_PRESETS.items())
 
@@ -84,9 +94,51 @@ def _bump(nodes, links, height_socket, strength):
     return bump
 
 
+def haze_group():
+    """
+    The node group every scenery material passes through on its way to the output.
+
+    It starts out doing nothing; ``sky.build`` rewrites its inside. Being one shared
+    group, a change of sky reaches every material without touching any of them.
+    """
+    group = bpy.data.node_groups.get(HAZE_GROUP)
+    if group is None:
+        group = bpy.data.node_groups.new(HAZE_GROUP, "ShaderNodeTree")
+        group.interface.new_socket("Shader", in_out='INPUT', socket_type="NodeSocketShader")
+        group.interface.new_socket("Shader", in_out='OUTPUT', socket_type="NodeSocketShader")
+        enter = group.nodes.new("NodeGroupInput")
+        leave = group.nodes.new("NodeGroupOutput")
+        group.links.new(enter.outputs[0], leave.inputs[0])
+    return group
+
+
+def add_haze(material):
+    """Route a material's surface through the haze group. Returns False if it already was, or cannot be."""
+    tree = material.node_tree
+    if tree is None:
+        return False
+    group = haze_group()
+    output = next((node for node in tree.nodes if node.type == 'OUTPUT_MATERIAL' and node.is_active_output), None)
+    if output is None or not output.inputs["Surface"].is_linked:
+        return False
+    source = output.inputs["Surface"].links[0].from_socket
+    if source.node.type == 'GROUP' and source.node.node_tree == group:
+        return False
+    node = tree.nodes.new("ShaderNodeGroup")
+    node.node_tree = group
+    node.label = "Distance Haze"
+    tree.links.new(source, node.inputs[0])
+    tree.links.new(node.outputs[0], output.inputs["Surface"])
+    return True
+
+
 def _finish(nodes, links, bsdf):
     output = nodes.new("ShaderNodeOutputMaterial")
-    links.new(bsdf.outputs[0], output.inputs["Surface"])
+    haze = nodes.new("ShaderNodeGroup")
+    haze.node_tree = haze_group()
+    haze.label = "Distance Haze"
+    links.new(bsdf.outputs[0], haze.inputs[0])
+    links.new(haze.outputs[0], output.inputs["Surface"])
 
 
 def terrain(key):
@@ -119,7 +171,11 @@ def terrain(key):
     stops = ramp.color_ramp.elements
     stops[0].position, stops[0].color = 0.0, (*shore, 1.0)
     stops[1].position, stops[1].color = low_line, (*low, 1.0)
-    for position, color in ((mid_line, mid), (peak_line, peak)):
+    # Each band holds its colour up to a short blend below the next line; a ramp that
+    # blended all the way between lines would leave most of the land a muddy average.
+    for position, color in (
+            (mid_line - BAND_BLEND, low), (mid_line, mid), (peak_line - BAND_BLEND, mid), (peak_line, peak),
+    ):
         stop = stops.new(position)
         stop.color = (*color, 1.0)
     links.new(ragged.outputs[0], ramp.inputs[0])
@@ -201,5 +257,92 @@ def clay(color=(0.55, 0.20, 0.12)):
     bsdf.inputs["Base Color"].default_value = (*color, 1.0)
     bsdf.inputs["Roughness"].default_value = 0.35
     bsdf.inputs["Coat Weight"].default_value = 0.4
+    _finish(nodes, links, bsdf)
+    return material
+
+
+# (dark, light) leaf colours and (dark, light) bark colours for each plant species.
+PLANT_COLORS = {
+    'CONIFER': (((0.010, 0.045, 0.025), (0.035, 0.11, 0.045)), ((0.045, 0.028, 0.018), (0.12, 0.075, 0.05))),
+    'BROADLEAF': (((0.025, 0.085, 0.015), (0.10, 0.23, 0.04)), ((0.05, 0.04, 0.03), (0.16, 0.13, 0.10))),
+    'PALM': (((0.03, 0.10, 0.015), (0.15, 0.27, 0.05)), ((0.10, 0.08, 0.06), (0.26, 0.21, 0.15))),
+    'DEAD': (None, ((0.09, 0.08, 0.07), (0.30, 0.28, 0.25))),
+    'BUSH': (((0.03, 0.075, 0.015), (0.12, 0.19, 0.05)), ((0.05, 0.035, 0.02), (0.14, 0.10, 0.07))),
+}
+
+
+def _mottled(nodes, links, dark, light, scale, stretch=1.0):
+    """Noise between two colours, in object space so a plant keeps its pattern wherever it stands."""
+    coords = nodes.new("ShaderNodeTexCoord")
+    mapping = nodes.new("ShaderNodeMapping")
+    mapping.inputs["Scale"].default_value = (scale, scale, scale / stretch)
+    links.new(coords.outputs["Object"], mapping.inputs["Vector"])
+    noise = nodes.new("ShaderNodeTexNoise")
+    noise.inputs["Scale"].default_value = 1.0
+    noise.inputs["Detail"].default_value = 5.0
+    links.new(mapping.outputs[0], noise.inputs["Vector"])
+    ramp = nodes.new("ShaderNodeValToRGB")
+    ramp.color_ramp.elements[0].position, ramp.color_ramp.elements[0].color = 0.3, (*dark, 1.0)
+    ramp.color_ramp.elements[1].position, ramp.color_ramp.elements[1].color = 0.7, (*light, 1.0)
+    links.new(noise.outputs[0], ramp.inputs[0])
+    return noise, ramp
+
+
+def foliage(species):
+    """Leaves: mottled green, each plant a slightly different shade so a forest is not a flat mass."""
+    name = "Scenery Leaves " + species.title()
+    if name in bpy.data.materials:
+        return bpy.data.materials[name]
+    material, nodes, links = _new(name)
+    dark, light = PLANT_COLORS[species][0]
+    noise, ramp = _mottled(nodes, links, dark, light, 1.6)
+
+    # Linked copies share this material; the object's random number is all that tells them apart.
+    info = nodes.new("ShaderNodeObjectInfo")
+    hue = _math(nodes, 'MULTIPLY_ADD', b=0.05)
+    hue.inputs[2].default_value = 0.475
+    links.new(info.outputs["Random"], hue.inputs[0])
+    value = _math(nodes, 'MULTIPLY_ADD', b=0.6)
+    value.inputs[2].default_value = 0.7
+    links.new(info.outputs["Random"], value.inputs[0])
+    shade = nodes.new("ShaderNodeHueSaturation")
+    links.new(hue.outputs[0], shade.inputs["Hue"])
+    links.new(value.outputs[0], shade.inputs["Value"])
+    links.new(ramp.outputs["Color"], shade.inputs["Color"])
+
+    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.inputs["Roughness"].default_value = 0.65
+    links.new(shade.outputs["Color"], bsdf.inputs["Base Color"])
+    links.new(_bump(nodes, links, noise.outputs[0], 0.5).outputs[0], bsdf.inputs["Normal"])
+    _finish(nodes, links, bsdf)
+    return material
+
+
+def bark(species):
+    name = "Scenery Bark " + species.title()
+    if name in bpy.data.materials:
+        return bpy.data.materials[name]
+    material, nodes, links = _new(name)
+    dark, light = PLANT_COLORS[species][1]
+    # Stretched along the trunk, the noise reads as furrows.
+    noise, ramp = _mottled(nodes, links, dark, light, 9.0, 8.0)
+    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.inputs["Roughness"].default_value = 0.9
+    links.new(ramp.outputs["Color"], bsdf.inputs["Base Color"])
+    links.new(_bump(nodes, links, noise.outputs[0], 0.7).outputs[0], bsdf.inputs["Normal"])
+    _finish(nodes, links, bsdf)
+    return material
+
+
+def ground(key):
+    """Flat land around a terrain, in the colour of that terrain's lowest ground."""
+    preset = TERRAIN_PRESETS[key]
+    name = "Scenery Ground " + preset["label"]
+    if name in bpy.data.materials:
+        return bpy.data.materials[name]
+    material, nodes, links = _new(name)
+    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.inputs["Base Color"].default_value = (*preset["colors"][0], 1.0)
+    bsdf.inputs["Roughness"].default_value = preset["roughness"]
     _finish(nodes, links, bsdf)
     return material
