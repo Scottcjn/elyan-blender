@@ -129,6 +129,32 @@ Not yet verified: anything on screen in a browser, headset, Unity or VRChat;
 VRChat limits in `elyan_llm/validate.py` are from memory; lip-sync from text
 alone is approximate (use the speech engine's phoneme times).
 
+## Elyan Quick Rename (`scripts/addons_core/elyan_rename`)
+
+Rename selected objects, their data, their materials, bones, vertex groups or
+shape keys from one small panel with a live preview: find and replace, add to
+the start or end, one name plus a running number, or remove the `.001` Blender
+adds to duplicates. 3D Viewport > Sidebar > Elyan > Quick Rename. On by default.
+
+## Tools that used to ship with Blender
+
+Blender 4.2 moved its bundled add-ons out to an online extensions site. These
+are back in the box, off until enabled in Preferences > Add-ons, taken from
+the last bundled versions (May 2024, GPL-2.0-or-later):
+
+LoopTools, F2, Bool Tool, Carver, Auto Mirror, BSurfaces, Edit Mesh Tools,
+Snap Utilities Line, Tissue, Align Tools, Copy Attributes, Modifier Tools,
+3D Navigation, Collection Manager, Edit Linked Library, Bone Selection Sets,
+Material Utilities, MeasureIt, Node Arrange, Cell Fracture, Skinify, Curve
+Tools, Extra Curve Objects, Extra Mesh Objects, BoltFactory, Sapling Tree Gen
+and A.N.T. Landscape.
+
+All 27 enable on Blender 5.2.2. Six operators were run as a spot check
+(LoopTools flatten, Sapling, BoltFactory, Bool Tool union and an extra mesh
+object finished; A.N.T. Landscape did not complete headless). The rest are
+untested beyond loading, and none has been tried in a window. 3D Viewport Pie
+Menus did not load and is left out.
+
 ## Building
 
 Large binary assets are stored with Git LFS on Blender's own server. After
