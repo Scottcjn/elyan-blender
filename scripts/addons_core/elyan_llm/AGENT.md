@@ -36,6 +36,18 @@ ask before changing it, and never work while they are in Edit Mode or sculpting.
    it and look. Numbers passing has not been the same as it looking right: an arm erased by mesh
    reduction, a face stuck mid-blink and a pond drawn as a square sheet all passed every number.
 
+## When a person has the file open
+
+- **Marks.** The artist can point at a spot and type a note ("Mark This" in the Elyan tab).
+  `eb --pid N marks` lists them with the object, world position, selected vertices or bones and the
+  nearest bone; `eb --pid N marks remove=ID` once dealt with. `state` shows how many are waiting.
+- **Proposals.** In a window session make changes with
+  `eb --pid N propose collection=Dress1850 note="neckline 8 mm higher" script=build/run.py`.
+  The artist sees the note and what changed, and presses Keep or Undo. There is no command to
+  approve: that button is theirs. `pending` shows what is waiting; `discard` withdraws your own.
+- **First time on a machine:** ask them to press "Test LLM Bridge" once. `state` then reports the
+  result under `window_selftest`. Until it has passed, treat undo and viewport capture as unproven.
+
 ## Safety
 
 - `eb --pid N checkpoint NAME COLLECTION` before a risky step; `rollback NAME` puts it back.

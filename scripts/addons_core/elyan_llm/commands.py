@@ -364,7 +364,8 @@ def cmd_checkpoint(args):
     Keep a copy of a collection's objects under ``name``, to return to with ``rollback``.
 
     The copies live in the hidden collection ``_checkpoint_<name>``, excluded from
-    every view layer, so nothing is saved to disk and nothing renders or exports.
+    every view layer, so nothing renders or exports. No file is written; the copy lives in
+    the scene, so it is kept if the .blend is saved while it exists.
     Objects in child collections are included. ``replace`` overwrites the name.
     """
     from . import checks

@@ -31,8 +31,14 @@ CHECKPOINT_PREFIX = "_checkpoint_"
 _snapshots = collections.OrderedDict()
 
 
+# The artist's pins (see marks.py) are notes, not part of the work being compared.
+MARKS_COLLECTION = "Elyan Marks"
+
+
 def is_checkpoint_object(ob):
-    return any(c.name.startswith(CHECKPOINT_PREFIX) for c in ob.users_collection)
+    """Objects that scene comparisons leave out: checkpoint copies and mark pins."""
+    return any(
+        c.name.startswith(CHECKPOINT_PREFIX) or c.name == MARKS_COLLECTION for c in ob.users_collection)
 
 
 # -----------------------------------------------------------------------------

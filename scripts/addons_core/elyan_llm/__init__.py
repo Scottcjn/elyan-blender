@@ -21,13 +21,17 @@ bl_info = {
 }
 
 import os
+import textwrap
 
 import bpy
 from bpy.app.handlers import persistent
-from bpy.props import BoolProperty, IntProperty
+from bpy.props import BoolProperty, IntProperty, StringProperty
 from bpy.types import AddonPreferences, Operator, Panel
 
-from . import commands, server
+from . import commands, marks, selftest, server, staging
+
+# Sidebar labels do not wrap; notes are cut into lines of about this many characters.
+WRAP = 38
 
 # Starts the bridge whatever the preference says, e.g. ``ELYAN_LLM_BRIDGE=1 blender``.
 ENV_AUTOSTART = "ELYAN_LLM_BRIDGE"
@@ -90,8 +94,116 @@ class ELYAN_OT_llm_stop(Operator):
         return {'FINISHED'}
 
 
+def _object_mode():
+    # Checkpoints copy objects, which misses edits still held by Edit Mode.
+    if bpy.context.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def _wrapped(layout, text, icon='NONE'):
+    for index, line in enumerate(textwrap.wrap(text, WRAP) or [""]):
+        layout.label(text=line, icon=icon if index == 0 else 'NONE')
+
+
+class ELYAN_OT_llm_selftest(Operator):
+    bl_idname = "elyan.llm_selftest"
+    bl_label = "Test LLM Bridge"
+    bl_description = (
+        "Check that the assistant can reach this window, that its changes can be undone "
+        "and that it can take pictures. Takes a few seconds and leaves the scene as it is"
+    )
+
+    def execute(self, context):
+        try:
+            selftest.start(_pref(context, "port", 0))
+        except (RuntimeError, OSError) as ex:
+            self.report({'WARNING'}, str(ex))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class ELYAN_OT_llm_mark(Operator):
+    bl_idname = "elyan.llm_mark"
+    bl_label = "Mark This"
+    bl_description = (
+        "Leave a pin with your note for the assistant: at the selection in Edit or Pose Mode, "
+        "at the 3D cursor otherwise"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    note: StringProperty(
+        name="Note",
+        description="What is wrong here, in your own words",
+    )
+
+    def execute(self, context):
+        wm = context.window_manager
+        # The panel's text field is used unless a script passes the note itself.
+        note = self.note.strip() or wm.elyan_llm_mark_note.strip()
+        mark = marks.add(marks.capture(note))
+        wm.elyan_llm_mark_note = ""
+        self.report({'INFO'}, "Marked: {:s}".format(mark["pin"]))
+        return {'FINISHED'}
+
+
+class ELYAN_OT_llm_mark_remove(Operator):
+    bl_idname = "elyan.llm_mark_remove"
+    bl_label = "Remove Mark"
+    bl_description = "Remove this mark and its pin"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    id: IntProperty(name="Mark", min=0)
+
+    def execute(self, context):
+        if not marks.remove({self.id}):
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class ELYAN_OT_llm_keep(Operator):
+    bl_idname = "elyan.llm_keep"
+    bl_label = "Keep"
+    bl_description = "Keep what the assistant changed"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return staging.pending(context.scene) is not None
+
+    def execute(self, context):
+        try:
+            _object_mode()
+            staging.keep(context.scene)
+        except (RuntimeError, ValueError) as ex:
+            self.report({'ERROR'}, str(ex))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class ELYAN_OT_llm_undo_change(Operator):
+    bl_idname = "elyan.llm_undo_change"
+    bl_label = "Undo"
+    bl_description = "Put everything back as it was before the assistant's change"
+    # Rolling back records its own undo step, see ``commands.cmd_rollback``.
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return staging.pending(context.scene) is not None
+
+    def execute(self, context):
+        try:
+            _object_mode()
+            staging.undo(context.scene)
+        except (RuntimeError, ValueError) as ex:
+            self.report({'ERROR'}, str(ex))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
 class ELYAN_PT_llm(Panel):
     bl_label = "LLM Bridge"
+    bl_idname = "ELYAN_PT_llm"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Elyan"
@@ -104,6 +216,7 @@ class ELYAN_PT_llm(Panel):
         else:
             layout.label(text="Not listening", icon='UNLINKED')
             layout.operator("elyan.llm_start", icon='PLAY')
+        self.draw_pending(context)
         if server.log:
             col = layout.column(align=True)
             col.label(text="Recent requests:")
@@ -112,6 +225,75 @@ class ELYAN_PT_llm(Panel):
                     text="{:s}  {:s}  {:s}".format(clock, cmd, summary),
                     icon='CHECKMARK' if ok else 'ERROR',
                 )
+        self.draw_selftest(context)
+
+    def draw_pending(self, context):
+        record = staging.pending(context.scene)
+        if record is None:
+            return
+        box = self.layout.box()
+        col = box.column(align=True)
+        col.label(text="The assistant changed something:", icon='INFO')
+        _wrapped(col, record.get("note", ""))
+        col = box.column(align=True)
+        for line in record.get("summary", ()):
+            _wrapped(col, line, icon='DOT')
+        if record.get("outside"):
+            col = box.column(align=True)
+            _wrapped(col, "Undo will not put these back: {:s}".format(", ".join(record["outside"])), icon='ERROR')
+        if record.get("sheet"):
+            box.label(text="Pictures: {:s}".format(os.path.basename(record["sheet"])), icon='IMAGE_DATA')
+        row = box.row(align=True)
+        row.scale_y = 1.4
+        row.operator("elyan.llm_keep", icon='CHECKMARK')
+        undo = row.row(align=True)
+        undo.enabled = bool(record.get("can_undo"))
+        undo.operator("elyan.llm_undo_change", icon='LOOP_BACK')
+
+    def draw_selftest(self, context):
+        layout = self.layout
+        active = selftest.running()
+        if active is not None:
+            label, steps = active
+            col = layout.column(align=True)
+            col.label(text="Testing: {:s}".format(label or "finishing"), icon='TIME')
+        else:
+            layout.operator("elyan.llm_selftest", icon='CHECKBOX_HLT')
+            result = selftest.last()
+            if result is None:
+                layout.label(text="Not tested in a window yet")
+                return
+            steps = result.get("steps", ())
+            col = layout.column(align=True)
+            col.label(
+                text="{:s} on {:s}".format(
+                    "Test passed" if result.get("passed") else "Test failed", str(result.get("date", ""))[:10]),
+                icon='CHECKMARK' if result.get("passed") else 'ERROR',
+            )
+        for step in steps:
+            col.label(text=str(step.get("label", "")), icon='CHECKMARK' if step.get("ok") else 'ERROR')
+            if not step.get("ok") and step.get("error"):
+                _wrapped(col, str(step["error"]), icon='BLANK1')
+
+
+class ELYAN_PT_llm_marks(Panel):
+    bl_label = "Marks"
+    bl_parent_id = "ELYAN_PT_llm"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Elyan"
+
+    def draw(self, context):
+        layout = self.layout
+        col = layout.column(align=True)
+        col.prop(context.window_manager, "elyan_llm_mark_note", text="")
+        col.operator("elyan.llm_mark", icon='PINNED')
+        col = layout.column(align=True)
+        for mark in marks.read(context.scene):
+            row = col.row(align=True)
+            text = "{:d}  {:s}".format(mark.get("id", 0), mark.get("note") or mark.get("object") or "")
+            row.label(text=text[:WRAP], icon='PINNED' if mark.get("author") == "artist" else 'DOT')
+            row.operator("elyan.llm_mark_remove", text="", icon='X').id = mark.get("id", 0)
 
 
 @persistent
@@ -137,13 +319,24 @@ classes = (
     ElyanLLMPreferences,
     ELYAN_OT_llm_start,
     ELYAN_OT_llm_stop,
+    ELYAN_OT_llm_selftest,
+    ELYAN_OT_llm_mark,
+    ELYAN_OT_llm_mark_remove,
+    ELYAN_OT_llm_keep,
+    ELYAN_OT_llm_undo_change,
     ELYAN_PT_llm,
+    ELYAN_PT_llm_marks,
 )
 
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+    # On the window manager, not the scene: a half-typed note is not part of the file.
+    bpy.types.WindowManager.elyan_llm_mark_note = StringProperty(
+        name="Note",
+        description="What is wrong at the spot you are marking, in your own words",
+    )
     for name, handler in _HANDLERS:
         getattr(bpy.app.handlers, name).append(handler)
 
@@ -157,8 +350,10 @@ def register():
 
 
 def unregister():
+    selftest.cancel()
     server.stop()
     for name, handler in _HANDLERS:
         getattr(bpy.app.handlers, name).remove(handler)
+    del bpy.types.WindowManager.elyan_llm_mark_note
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
