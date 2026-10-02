@@ -26,6 +26,17 @@ instead of starting a new process for every step.
 - Safety: `checkpoint` / `rollback` of a collection without saving the file.
 - Long work: `submit` / `status` / `result` / `cancel`; a request that times out
   keeps running and returns a job id instead of inviting a blind resend.
+- Starting out: `state` (file, window or headless, selection, what is waiting),
+  `help`, and a one-screen card when the client is run bare. `AGENT.md` in the
+  add-on folder is the one-page working loop.
+- Numbers, not meshes: `contract` lists the constants of a contract file and
+  changes one, keeping comments, copying the old file and adding a changelog
+  line. `compare` measures a silhouette against a reference photo or another
+  image without rendering: overlap, half-width at each height, worst row.
+- With a person at the window: "Mark This" pins a note to a spot (`marks`
+  lists them); `propose` makes a change the artist then keeps or undoes from
+  the panel (there is no command to approve); "Test LLM Bridge" checks the
+  window paths once and `state` reports the result.
 - `client.py` is a standard-library command-line client:
 
   ```sh
@@ -39,8 +50,9 @@ Anything that can read the session file (owner-only, in the user config
 directory) can run Python as you. Same-user processes are trusted; nothing
 else is.
 
-Not yet tested with a real window: the UI timer path, viewport capture,
-screenshot and undo steps.
+Not yet run in a real window by its developers: the timer path, viewport
+capture, screenshot, undo steps and the panel. "Test LLM Bridge" exists to
+find out on the artist's machine.
 
 ## Elyan Scenery (`scripts/addons_core/elyan_scenery`)
 
@@ -128,6 +140,28 @@ head-only mesh (9.6 MB).
 Not yet verified: anything on screen in a browser, headset, Unity or VRChat;
 VRChat limits in `elyan_llm/validate.py` are from memory; lip-sync from text
 alone is approximate (use the speech engine's phoneme times).
+
+## Elyan Garment (`scripts/addons_core/elyan_garment`)
+
+One-call tools for fitting clothes to an avatar body, each returning numbers
+and refusing (mesh untouched) when its own check fails. Functions on named
+objects, buttons in the sidebar's Elyan tab, and bridge commands
+`garment_weights`, `garment_weld`, `garment_fit`, `garment_shapekeys`.
+
+- **weights**: give a garment the body's skinning from the nearest surface,
+  deform bones only, at most four influences, normalised; smooths
+  automatically where a skirt would shear between two legs.
+- **weld**: move an open edge exactly onto a ring of points or another
+  object's edge (within 1e-7 m in tests), easing the rows beside it.
+- **fit**: push only what is closer to the body than the ease outward, never
+  past a limit and never the pinned groups; reports where the body still
+  shows through faces.
+- **shapekeys**: make the garment follow the body's sliders, refusing any key
+  that makes clearance worse.
+
+105 assertions pass on Blender 5.2.2 and 4.3.2, and it was run on a generated
+person. Known weak spots: skirts standing off the body, sleeves near the
+torso, tight ease in hard bends, high collars (untested). Not seen in a window.
 
 ## Elyan Quick Rename (`scripts/addons_core/elyan_rename`)
 

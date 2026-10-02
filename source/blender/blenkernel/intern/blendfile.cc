@@ -1544,6 +1544,7 @@ UserDef *BKE_blendfile_userdef_from_defaults()
         "elyan_rename",
         "elyan_poselib",
         "elyan_restpose",
+        "elyan_garment",
         "bl_pkg",
     };
     for (int i = 0; i < ARRAY_SIZE(addons); i++) {
