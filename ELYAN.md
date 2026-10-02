@@ -136,6 +136,26 @@ shape keys from one small panel with a live preview: find and replace, add to
 the start or end, one name plus a running number, or remove the `.001` Blender
 adds to duplicates. 3D Viewport > Sidebar > Elyan > Quick Rename. On by default.
 
+## Pose Library (Classic) (`scripts/addons_core/elyan_poselib`)
+
+The pose list Blender had until 3.5: pose the rig, press "+", name it; pick a
+name, press Apply. Properties > Armature > Pose Library, and in Pose Mode the
+sidebar's Elyan tab. On by default.
+
+- Same operators as before (`poselib.new`, `pose_add`, `pose_remove`,
+  `pose_rename`, `pose_move`, `apply_pose`, `browse_interactive`,
+  `action_sanitize`), the same Pose Mode shortcuts (Shift L add, Alt L browse,
+  Shift Alt L remove, Ctrl Shift L rename), and `Object.pose_library` again.
+- Same storage: an Action with one keyed frame per pose and a pose marker
+  naming it. A library made in Blender 3.4 was opened in 5.2.2 and 4.3.2 and
+  its poses applied with the right values. Old files do not remember which
+  armature a library belonged to: choose the action in the panel once.
+- Poses store location, rotation and scale of the selected bones (all bones if
+  none are selected) and apply to the selection in the same way. Custom
+  properties and bendy-bone settings are not stored.
+- Tested headless on both versions, including save and reload. The interactive
+  browser and the shortcuts need a window and have not been tried.
+
 ## Tools that used to ship with Blender
 
 Blender 4.2 moved its bundled add-ons out to an online extensions site. These

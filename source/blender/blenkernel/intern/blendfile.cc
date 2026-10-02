@@ -1542,6 +1542,7 @@ UserDef *BKE_blendfile_userdef_from_defaults()
         "elyan_llm",
         "elyan_scenery",
         "elyan_rename",
+        "elyan_poselib",
         "bl_pkg",
     };
     for (int i = 0; i < ARRAY_SIZE(addons); i++) {
