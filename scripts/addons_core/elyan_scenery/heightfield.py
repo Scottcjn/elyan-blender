@@ -136,6 +136,26 @@ def _plains(n, rng):
     return 0.18 * fbm(n, rng, octaves=5, cells=2, gain=0.4)
 
 
+def rolls(n, seed):
+    """Gentle rolling ground, 0..1, for places seen from a few metres away."""
+    rng = np.random.default_rng(seed)
+    return normalize(0.75 * fbm(n, rng, octaves=3, cells=2, gain=0.45) + 0.25 * fbm(n, rng, octaves=5, cells=5))
+
+
+def basin(n, center, radii, shore):
+    """
+    Oval hollow as a 0..1 depth profile: 1 across the middle, easing to 0 over the bank.
+
+    ``center`` and ``radii`` are (u, v) in 0..1 of the field; ``shore`` is the width
+    of the bank beyond the rim, in the same unit.
+    """
+    axis = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    # Distance in "rim units": 1 on the rim.
+    reach = np.hypot((axis[None, :] - center[0]) / radii[0], (axis[:, None] - center[1]) / radii[1])
+    bank = 1.0 + shore / min(radii)
+    return _smoothstep(np.clip((bank - reach) / (bank - 0.55), 0.0, 1.0)).astype(np.float32)
+
+
 LANDSCAPES = {
     'MOUNTAINS': _mountains,
     'HILLS': _hills,

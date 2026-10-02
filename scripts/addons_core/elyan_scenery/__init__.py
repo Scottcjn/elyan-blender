@@ -23,7 +23,7 @@ import bpy
 from bpy.props import PointerProperty
 from bpy.types import Menu, Panel
 
-from . import instant, objects, scatter, sky, terrain, trees
+from . import instant, objects, scatter, sky, terrain, trees, world
 
 
 class _SceneryPanel:
@@ -39,7 +39,10 @@ class ELYAN_PT_scenery_create(_SceneryPanel, Panel):
         layout = self.layout
         col = layout.column()
         col.scale_y = 1.5
-        col.operator("elyan_scenery.instant", icon='WORLD')
+        # Choosing an environment builds it; seed, sky and plants are in the redo panel.
+        col.operator_menu_enum("elyan_scenery.world", "environment", text="World", icon='WORLD')
+        col = layout.column(align=True)
+        col.operator("elyan_scenery.instant", icon='SHADERFX')
         col = layout.column(align=True)
         col.operator("elyan_scenery.terrain_add", icon='RNDCURVE')
         col.operator("elyan_scenery.water_add", icon='MOD_OCEAN')
@@ -113,7 +116,8 @@ class ELYAN_MT_scenery_add(Menu):
     def draw(self, context):
         layout = self.layout
         layout.operator_context = 'INVOKE_REGION_WIN'
-        layout.operator("elyan_scenery.instant", icon='WORLD')
+        layout.operator_menu_enum("elyan_scenery.world", "environment", text="World", icon='WORLD')
+        layout.operator("elyan_scenery.instant", icon='SHADERFX')
         layout.separator()
         layout.operator("elyan_scenery.terrain_add", icon='RNDCURVE')
         layout.operator("elyan_scenery.water_add", icon='MOD_OCEAN')
@@ -138,6 +142,7 @@ classes = (
     *trees.classes,
     *scatter.classes,
     *instant.classes,
+    *world.classes,
     ELYAN_PT_scenery_create,
     ELYAN_PT_scenery_terrain,
     ELYAN_PT_scenery_sky,

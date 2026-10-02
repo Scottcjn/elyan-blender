@@ -47,8 +47,17 @@ screenshot and undo steps.
 Landscape generation in the spirit of 1990s scenery programs.
 3D Viewport > Sidebar > Scenery, or Add > Scenery.
 
-- **Instant Scenery**: one click builds terrain, water, rocks, sky and a camera
-  with a clear view. Same seed, same scene.
+- **World**: choose a kind of environment and get the whole scene, at one of
+  two scales. *Vistas* are land seen from afar: alpine range, rolling hills,
+  tropical island, desert dunes, canyonlands, volcano, arctic peaks, moonscape,
+  alien world. *Places* are ground seen from standing height: meadow with pond,
+  wildflower field, forest clearing, desert oasis, winter clearing, built from
+  rolling ground, a pond with rim stones and lilies, grass, drifts of flowers,
+  nearby trees and a far treeline. Seed, sky and plant density are options.
+  From Python: `from elyan_scenery import world; world.list_environments();
+  world.build(bpy.context, "MEADOW_POND", seed=7, time="GOLDEN")`.
+- **Instant Scenery**: the vista builder on its own, with landscape, ground and
+  sky chosen separately. Same seed, same scene.
 - **Terrain**: nine fractal landscapes; rain and scree erosion; smooth, terrace,
   raise, lower, sharpen, invert, edge falloff; paint heights as an image and
   read them back; change resolution without losing shape.
@@ -64,7 +73,8 @@ Every tool is an operator, so the LLM bridge can drive all of it.
 - **Plants**: conifer, broadleaf, palm, dead tree and bush, built to a triangle
   budget; rule-based scatter by density, altitude, slope, water and spacing.
 
-Known gaps: haze is a render effect and does not export; on Blender 4.3 the old
+Known gaps: grass is render-time strands and does not export; flowers and
+trees are simple low-poly shapes; haze is a render effect and does not export; on Blender 4.3 the old
 sky model leaves a brown band at the horizon; trees have no UVs; no terrain
 sculpt brushes (use the height image); the panels have not been seen in a window.
 

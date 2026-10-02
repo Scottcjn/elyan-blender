@@ -121,6 +121,97 @@ def _frame_camera(context, ground, water_level, rng, outside, high):
     return camera, aim
 
 
+def build(context, landscape='RANDOM', seed=1, ground_key='AUTO', sky_key='AUTO', size=300.0, resolution=385,
+          erosion=0.3, use_water=True, rock_count=12, plant_factor=1.0):
+    """
+    Build a vista: terrain, water, rocks, plants, sky and a camera with a clear view.
+
+    'RANDOM' and 'AUTO' leave the choice to the seed. Returns a report of what was made.
+    """
+    rng = random.Random(seed)
+    kind = landscape if landscape != 'RANDOM' else rng.choice(sorted(_PAIRINGS))
+    grounds, skies = _PAIRINGS[kind]
+    height = size * rng.uniform(0.14, 0.22) * (0.5 if kind in {'DUNES', 'HILLS', 'CRATERS'} else 1.0)
+
+    grid = heightfield.generate(kind, resolution, seed)
+    if erosion > 0.0:
+        grid = heightfield.hydraulic_erosion(grid, int(20 + 120 * erosion), seed)
+        grid = heightfield.thermal_erosion(grid, int(4 + 20 * erosion))
+    ground = terrain.create(context, "Terrain", grid.astype("float32"), size, height)
+    # The seed's choice is drawn even when overridden, so the rest of the scene stays the same.
+    ground_material = rng.choice(grounds)
+    if ground_key != 'AUTO':
+        ground_material = ground_key
+    ground.data.materials.append(materials.terrain(ground_material))
+
+    low, high = float(grid.min()) * height, float(grid.max()) * height
+    water = None
+    if use_water and kind in _WET:
+        water = height * (0.06 if kind == 'ISLAND' else rng.uniform(0.10, 0.20))
+        # Wide enough that its far edge is lost in the haze instead of drawing a line under the sky.
+        objects.add_water(context, water, size * 40.0)
+    else:
+        # Dry land carries on to the horizon; without it the sky below the horizon shows, and that is black.
+        plain = objects.add_water(context, low - 0.01 * height, size * 40.0)
+        plain.name = plain.data.name = "Ground"
+        plain.data.materials[0] = materials.ground(ground_material)
+
+    # Drawn even when overridden, like the ground, so the rest of the scene stays the same.
+    drawn = rng.choice(skies)
+    preset = sky.SKY_PRESETS[drawn if sky_key == 'AUTO' else sky_key]
+    camera, aim = _frame_camera(
+        context, ground, -1.0 if water is None else water, rng,
+        kind in {'ISLAND', 'VOLCANO'}, kind in {'CANYON', 'PLATEAU'},
+    )
+
+    # Everything is sized for a 300 m terrain and scales with it.
+    factor = size / 300.0
+    eye = ground.matrix_world.inverted() @ camera.location
+    count = 0
+    if rock_count:
+        # Many more tries than rocks wanted, so that the count is met even on a flooded terrain.
+        rocks = scatter.scatter(
+            context, ground, 'ROCK', seed, density=rock_count * 8.0 / (size * size / 10000.0),
+            scale=(0.6, 3.0), size_factor=factor, variants=4, limit=rock_count, water=water,
+            avoid=((eye.x, eye.y, 4.0 * factor),),
+        )
+        count += len(rocks.objects) if rocks else 0
+    shore = (max(low, water or low) - low) / max(high - low, 1e-9)
+    # Nothing right in front of the lens, and less and less of a gap further along the view.
+    ahead = Vector((aim.x, aim.y)).normalized()
+    clear = tuple(
+        (eye.x + ahead.x * reach * factor, eye.y + ahead.y * reach * factor, radius * factor)
+        for reach, radius in ((0.0, 14.0), (22.0, 12.0), (44.0, 9.0))
+    )
+    for index, (what, rules) in enumerate(_PLANTS[ground_material] if plant_factor > 0.0 else ()):
+        rules = dict(rules)
+        if "shore" in rules:
+            rules["altitude"] = (0.0, shore + rules.pop("shore"))
+        # Densities are per hectare of a 300 m terrain: a bigger terrain has bigger trees, not more of them.
+        rules["density"] *= plant_factor / (factor * factor)
+        plants = scatter.scatter(
+            context, ground, what, seed + index + 1, size_factor=factor * _PLANT_SCALE, triangles=600,
+            water=water, avoid=clear, **rules,
+        )
+        count += len(plants.objects) if plants else 0
+
+    # Light from behind and beside the camera reads better than a fixed compass direction.
+    facing = math.degrees(math.atan2(aim.x, aim.y))
+    sky.build(
+        context.scene, preset["elevation"], facing + rng.uniform(100.0, 150.0) * rng.choice((-1, 1)),
+        preset["haze"], preset["clouds"], preset.get("stars", 0.0),
+        preset.get("mist", 0.0), preset.get("mist_color", (1.0, 1.0, 1.0)),
+    )
+    for other in context.selected_objects:
+        other.select_set(False)
+    ground.select_set(True)
+    context.view_layer.objects.active = ground
+    return {
+        "landscape": kind, "ground": ground.name, "ground_material": ground_material, "size": size,
+        "water_level": water, "scattered": count, "camera": camera.name,
+    }
+
+
 class ELYAN_OT_instant(Operator):
     """Build a whole landscape: terrain, water, rocks, plants, sky and a camera looking at it"""
     bl_idname = "elyan_scenery.instant"
@@ -151,85 +242,12 @@ class ELYAN_OT_instant(Operator):
     )
 
     def execute(self, context):
-        rng = random.Random(self.seed)
-        kind = self.landscape if self.landscape != 'RANDOM' else rng.choice(sorted(_PAIRINGS))
-        grounds, skies = _PAIRINGS[kind]
-        size = self.size
-        height = size * rng.uniform(0.14, 0.22) * (0.5 if kind in {'DUNES', 'HILLS', 'CRATERS'} else 1.0)
-
-        grid = heightfield.generate(kind, self.resolution, self.seed)
-        if self.erosion > 0.0:
-            grid = heightfield.hydraulic_erosion(grid, int(20 + 120 * self.erosion), self.seed)
-            grid = heightfield.thermal_erosion(grid, int(4 + 20 * self.erosion))
-        ground = terrain.create(context, "Terrain", grid.astype("float32"), size, height)
-        # The seed's choice is drawn even when overridden, so the rest of the scene stays the same.
-        ground_material = rng.choice(grounds)
-        if self.ground != 'AUTO':
-            ground_material = self.ground
-        ground.data.materials.append(materials.terrain(ground_material))
-
-        low, high = float(grid.min()) * height, float(grid.max()) * height
-        water = None
-        if self.use_water and kind in _WET:
-            water = height * (0.06 if kind == 'ISLAND' else rng.uniform(0.10, 0.20))
-            # Wide enough that its far edge is lost in the haze instead of drawing a line under the sky.
-            objects.add_water(context, water, size * 40.0)
-        else:
-            # Dry land carries on to the horizon; without it the sky below the horizon shows, and that is black.
-            plain = objects.add_water(context, low - 0.01 * height, size * 40.0)
-            plain.name = plain.data.name = "Ground"
-            plain.data.materials[0] = materials.ground(ground_material)
-
-        sky_key = rng.choice(skies)
-        preset = sky.SKY_PRESETS[sky_key if self.sky == 'AUTO' else self.sky]
-        camera, aim = _frame_camera(
-            context, ground, -1.0 if water is None else water, rng,
-            kind in {'ISLAND', 'VOLCANO'}, kind in {'CANYON', 'PLATEAU'},
+        report = build(
+            context, self.landscape, self.seed, self.ground, self.sky, self.size, self.resolution,
+            self.erosion, self.use_water, self.rocks, self.plants,
         )
-
-        # Everything is sized for a 300 m terrain and scales with it.
-        factor = size / 300.0
-        eye = ground.matrix_world.inverted() @ camera.location
-        count = 0
-        if self.rocks:
-            # Many more tries than rocks wanted, so that the count is met even on a flooded terrain.
-            rocks = scatter.scatter(
-                context, ground, 'ROCK', self.seed, density=self.rocks * 8.0 / (size * size / 10000.0),
-                scale=(0.6, 3.0), size_factor=factor, variants=4, limit=self.rocks, water=water,
-                avoid=((eye.x, eye.y, 4.0 * factor),),
-            )
-            count += len(rocks.objects) if rocks else 0
-        shore = (max(low, water or low) - low) / max(high - low, 1e-9)
-        # Nothing right in front of the lens, and less and less of a gap further along the view.
-        ahead = Vector((aim.x, aim.y)).normalized()
-        clear = tuple(
-            (eye.x + ahead.x * reach * factor, eye.y + ahead.y * reach * factor, radius * factor)
-            for reach, radius in ((0.0, 14.0), (22.0, 12.0), (44.0, 9.0))
-        )
-        for index, (what, rules) in enumerate(_PLANTS[ground_material] if self.plants > 0.0 else ()):
-            rules = dict(rules)
-            if "shore" in rules:
-                rules["altitude"] = (0.0, shore + rules.pop("shore"))
-            # Densities are per hectare of a 300 m terrain: a bigger terrain has bigger trees, not more of them.
-            rules["density"] *= self.plants / (factor * factor)
-            plants = scatter.scatter(
-                context, ground, what, self.seed + index + 1, size_factor=factor * _PLANT_SCALE, triangles=600,
-                water=water, avoid=clear, **rules,
-            )
-            count += len(plants.objects) if plants else 0
-
-        # Light from behind and beside the camera reads better than a fixed compass direction.
-        facing = math.degrees(math.atan2(aim.x, aim.y))
-        sky.build(
-            context.scene, preset["elevation"], facing + rng.uniform(100.0, 150.0) * rng.choice((-1, 1)),
-            preset["haze"], preset["clouds"], preset.get("stars", 0.0),
-            preset.get("mist", 0.0), preset.get("mist_color", (1.0, 1.0, 1.0)),
-        )
-        for other in context.selected_objects:
-            other.select_set(False)
-        ground.select_set(True)
-        context.view_layer.objects.active = ground
-        self.report({'INFO'}, "{:s}, seed {:d}, {:d} rocks and plants".format(kind.title(), self.seed, count))
+        self.report({'INFO'}, "{:s}, seed {:d}, {:d} rocks and plants".format(
+            report["landscape"].title(), self.seed, report["scattered"]))
         return {'FINISHED'}
 
 

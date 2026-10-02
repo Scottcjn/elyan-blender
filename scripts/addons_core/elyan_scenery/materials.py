@@ -55,6 +55,27 @@ TERRAIN_PRESETS = {
         "colors": ((0.10, 0.02, 0.14), (0.30, 0.04, 0.24), (0.05, 0.22, 0.25), (0.75, 0.80, 0.25), (0.05, 0.02, 0.09)),
         "lines": (0.10, 0.45, 0.80), "cliff": 0.8, "roughness": 0.6,
     },
+    # Ground for places seen close up. The lowest band is the wet edge of a pond.
+    'MEADOW': {
+        "label": "Meadow",
+        "colors": ((0.09, 0.065, 0.04), (0.05, 0.15, 0.025), (0.07, 0.18, 0.03), (0.09, 0.19, 0.04), (0.10, 0.08, 0.05)),
+        "lines": (0.10, 0.55, 0.85), "cliff": 0.5, "roughness": 0.9,
+    },
+    'FOREST': {
+        "label": "Forest Floor",
+        "colors": ((0.06, 0.045, 0.03), (0.07, 0.075, 0.03), (0.10, 0.075, 0.04), (0.06, 0.09, 0.03), (0.07, 0.055, 0.04)),
+        "lines": (0.10, 0.55, 0.85), "cliff": 0.5, "roughness": 0.95,
+    },
+    'SAND': {
+        "label": "Sand",
+        "colors": ((0.30, 0.22, 0.13), (0.62, 0.47, 0.28), (0.68, 0.52, 0.31), (0.72, 0.57, 0.36), (0.42, 0.30, 0.18)),
+        "lines": (0.10, 0.55, 0.85), "cliff": 0.4, "roughness": 0.95,
+    },
+    'SNOW': {
+        "label": "Snow",
+        "colors": ((0.20, 0.28, 0.36), (0.55, 0.60, 0.67), (0.60, 0.64, 0.70), (0.63, 0.67, 0.72), (0.12, 0.14, 0.17)),
+        "lines": (0.10, 0.55, 0.85), "cliff": 0.6, "roughness": 0.55,
+    },
 }
 
 # Altitude over which one band's colour gives way to the next.
@@ -141,15 +162,21 @@ def _finish(nodes, links, bsdf):
     links.new(haze.outputs[0], output.inputs["Surface"])
 
 
-def terrain(key):
-    """Lowlands, uplands and peaks by altitude, bare rock wherever it is steep."""
+def terrain(key, lines=None):
+    """
+    Lowlands, uplands and peaks by altitude, bare rock wherever it is steep.
+
+    ``lines`` replaces the preset's band altitudes, for ground whose bands must sit
+    at measured heights (the wet edge of a pond). Such a material is made afresh,
+    not shared.
+    """
     preset = TERRAIN_PRESETS[key]
     name = "Scenery Terrain " + preset["label"]
-    if name in bpy.data.materials:
+    if lines is None and name in bpy.data.materials:
         return bpy.data.materials[name]
     material, nodes, links = _new(name)
     shore, low, mid, peak, cliff = preset["colors"]
-    low_line, mid_line, peak_line = preset["lines"]
+    low_line, mid_line, peak_line = lines or preset["lines"]
 
     coords = nodes.new("ShaderNodeTexCoord")
     # Generated Z runs 0..1 from the lowest to the highest point of the terrain.
@@ -344,5 +371,42 @@ def ground(key):
     bsdf = nodes.new("ShaderNodeBsdfPrincipled")
     bsdf.inputs["Base Color"].default_value = (*preset["colors"][0], 1.0)
     bsdf.inputs["Roughness"].default_value = preset["roughness"]
+    _finish(nodes, links, bsdf)
+    return material
+
+
+def plain(name, color, roughness=0.6):
+    """A flat colour, shared by name."""
+    name = "Scenery " + name
+    if name in bpy.data.materials:
+        return bpy.data.materials[name]
+    material, nodes, links = _new(name)
+    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.inputs["Base Color"].default_value = (*color, 1.0)
+    bsdf.inputs["Roughness"].default_value = roughness
+    _finish(nodes, links, bsdf)
+    return material
+
+
+def grass(color):
+    """Blades: darker at the root, each strand a slightly different shade."""
+    name = "Scenery Grass"
+    if name in bpy.data.materials:
+        return bpy.data.materials[name]
+    material, nodes, links = _new(name)
+    strand = nodes.new("ShaderNodeHairInfo")
+    ramp = nodes.new("ShaderNodeValToRGB")
+    ramp.color_ramp.elements[0].color = (*(c * 0.35 for c in color), 1.0)
+    ramp.color_ramp.elements[1].color = (*color, 1.0)
+    links.new(strand.outputs["Intercept"], ramp.inputs[0])
+    shade = nodes.new("ShaderNodeHueSaturation")
+    value = _math(nodes, 'MULTIPLY_ADD', b=0.7)
+    value.inputs[2].default_value = 0.65
+    links.new(strand.outputs["Random"], value.inputs[0])
+    links.new(value.outputs[0], shade.inputs["Value"])
+    links.new(ramp.outputs["Color"], shade.inputs["Color"])
+    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.inputs["Roughness"].default_value = 0.6
+    links.new(shade.outputs["Color"], bsdf.inputs["Base Color"])
     _finish(nodes, links, bsdf)
     return material
